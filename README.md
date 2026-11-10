@@ -1,19 +1,16 @@
 # 学术引用幻觉检测中低成本书目信号的有效性与局限
 
-《文献真实性校验与证据对齐》课程项目最终课程论文的**完整复现仓库**：论文正文、排版版 PDF、复现脚本、官方实现与数据、逐样本预测、九组实验图与运行记录。
+《文献真实性校验与证据对齐》课程项目最终课程论文的**完整复现仓库**：论文正文（Markdown）、复现脚本、官方实现与数据、逐样本预测、九组实验图与运行记录。
 
-> **上传后必做**：全仓库搜索 `OWNER/REPO` 并替换为你的 GitHub 用户名与仓库名（出现在 `README.md`、`paper.md` 末尾的链接定义、`paper_src/course_paper.tex` 的 `\CodeDataURL` 等处）。替换后重新编译 PDF，并把真实可下载链接回填到课程论文。步骤见 [docs/github-upload.md](docs/github-upload.md)。
+仓库地址：<https://github.com/WHYFeature/DeepminingProject>
 
 ## 导航
 
 | 我想…… | 打开 |
 |---|---|
 | 读课程论文（Markdown，九图已内嵌、四表可直接渲染） | [paper.md](paper.md) |
-| 看排版版 PDF（20 页） | [paper.pdf](paper.pdf) |
 | 校验存档 / 重跑离线实验 | [docs/reproduction.md](docs/reproduction.md) |
-| 上传到 GitHub 并回填链接 | [docs/github-upload.md](docs/github-upload.md) |
-| 提交前逐条核对 | [docs/submission-checklist.md](docs/submission-checklist.md) |
-| 重新编译 LaTeX 源码 | [paper_src/README.md](paper_src/README.md) |
+| 下载代码与数据归档 | [main.zip](https://github.com/WHYFeature/DeepminingProject/archive/refs/heads/main.zip) |
 
 ## 研究问题与主要结论
 
@@ -29,8 +26,8 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/OWNER/REPO.git
-cd REPO
+git clone https://github.com/WHYFeature/DeepminingProject.git
+cd DeepminingProject
 python -m pip install -r code/requirements.txt
 python code/verify_results.py              # 完整性校验：退出码 0 表示数据、预测、图表自洽
 python code/run_extended_experiments.py    # 重跑离线实验（会覆盖 results/ 与 figures/ 的同名文件）
@@ -42,15 +39,13 @@ Python ≥ 3.10（实测 3.12.14）。无需 GPU、无需预训练权重；重�
 
 | 路径 | 内容 |
 |---|---|
-| `paper.md` | 课程论文 Markdown 版（10 章、4 表、9 图、15 条参考文献） |
-| `paper.pdf` | 由 `paper_src/course_paper.tex` 编译的 20 页 A4 论文 |
-| `paper_src/` | 自包含 LaTeX 源码（含 `.bbl`，可在无参考文献数据库时编译两遍） |
+| `paper.md` | 课程论文 Markdown 版（10 章、4 表、9 图、15 条参考文献，正文约 7,960 中文字符） |
 | `code/` | `run_extended_experiments.py`、`verify_results.py`、`requirements.txt` |
 | `official/` | HALLMARK 官方 Python 包、`pyproject.toml`、MIT 许可证与固定版本号 |
 | `data/` | 官方数据 v1.2（含公开开发集、公开测试集、压力集与官方基线结果） |
-| `results/` | 16 份逐样本预测（15,600 条）、20 条在线观测、汇总 JSON、统计 CSV、三份 LaTeX 表格 |
-| `figures/` | 九组实验图的矢量 PDF 与 220 dpi PNG（Markdown 与 LaTeX 共用） |
-| `docs/` | 复现说明、GitHub 上传指南、提交核对清单 |
+| `results/` | 16 份逐样本预测（15,600 条）、20 条在线观测、汇总 JSON 与统计 CSV |
+| `figures/` | 九组实验图的 220 dpi PNG（供 `paper.md` 内嵌） |
+| `docs/` | 复现说明与运行记录 |
 | `MANIFEST.sha256` | 全仓文件 SHA-256 校验清单 |
 
 ## 版本与许可
@@ -58,7 +53,7 @@ Python ≥ 3.10（实测 3.12.14）。无需 GPU、无需预训练权重；重�
 - 上游仓库：`https://github.com/rpatrik96/hallmark`，固定版本 `f774fa40675daa83eca6201637a94c4536b7bb3e`（`official/VERSION.txt`）。
 - 官方实现按上游 **MIT** 许可原样保留，见 `official/LICENSE`；本仓库新增的脚本、文档与论文见根目录 [LICENSE](LICENSE)。
 - 数据版本 v1.2（metadata 1.2.3）；`dev_public.jsonl` SHA-256 为 `e1d3fd8e66191dae1d9cc4317cec870a99966f4d558a8601ebf533b362ed263a`。
-- 仓库不含 `.git`、Python 缓存、第三方依赖副本，也不含机器专属路径；全部路径相对于仓库根目录。
+- 仓库不含嵌套 `.git`、Python 缓存、第三方依赖副本，也不含机器专属路径；全部路径相对于仓库根目录。
 
 引用上游工作：
 
@@ -81,10 +76,12 @@ Python ≥ 3.10（实测 3.12.14）。无需 GPU、无需预训练权重；重�
 
 ## 代码与数据可下载链接
 
-GitHub 仓库本身提供可下载归档：
+仓库主页：<https://github.com/WHYFeature/DeepminingProject>
+
+归档压缩包（直接下载全部代码与数据）：
 
 ```
-https://github.com/OWNER/REPO/archive/refs/heads/main.zip
+https://github.com/WHYFeature/DeepminingProject/archive/refs/heads/main.zip
 ```
 
-也可以在 Release 中附上 `GitHub仓库_上传包.zip`。若课程助教只接受云盘链接，把同一份 zip 上传云盘并在论文中同时给出两个地址。任务书要求「可下载链接附在最终课程论文中」，因此无论选哪条通道，都需把真实地址回填到 [paper.md](paper.md) 与 [paper_src/course_paper.tex](paper_src/course_paper.tex)。
+归档内容与本仓库一致，可用 `MANIFEST.sha256` 逐文件核对；论文「结论」与「代码与数据可用性」两处均已写入上述地址。

@@ -23,13 +23,13 @@
 | 实验 | 设置 | 主要输出 |
 |---|---|---|
 | 数据审计 | 三个公开划分共 2,071 条，统计字段完整度、DOI 比例、重复标题与跨划分交集 | `extended_summary.json`、`fig01_*`、`fig02_*` |
-| 全量离线对照 | dev/test × 八条基线，共 15,600 条逐样本预测 | `predictions/*.jsonl`、`baseline_table.tex`、`fig03_*`、`fig04_*` |
+| 全量离线对照 | dev/test × 八条基线，共 15,600 条逐样本预测 | `predictions/*.jsonl`、`extended_summary.json`、`fig03_*`、`fig04_*` |
 | 随机稳定性 | 两划分各 100 个固定种子（0–99） | `random_100_seeds.csv`、`fig05_*` |
 | 样本量敏感性 | 规模 20/50/100/200/500/1119，各 500 次分层有放回抽样 | `sampling_uncertainty.csv`、`fig06_*` |
 | 在线结果不确定性 | 固定 20 条结果的 5,000 次分层 bootstrap | `extended_summary.json` |
 | 校准顺序敏感性 | 同一组预测随机排列 100 次，比较等频/等宽 ECE | `ece_order_sensitivity.csv` |
 | 选择性输出 | 最低置信度阈值 0.50/0.60/0.75/0.85/0.90 | `smoke_threshold_analysis.csv`、`fig09_*` |
-| 真实案例 | 20 条在线样本的完整标题、标签、预测、原因与服务状态；论文取其中 12 例 | `smoke_actual_cases.csv`、`actual_cases_table.tex` |
+| 真实案例 | 20 条在线样本的完整标题、标签、预测、原因与服务状态；论文取其中 12 例 | `smoke_actual_cases.csv` |
 
 八条参考线：恒预测 VALID、恒预测 HALLUCINATED、随机（seed 42）、DOI 存在性、年份边界、作者格式、年份与作者并集、venue oracle。最后一条是官方源码明确标注的数据构造偏差探针，不是可部署检测器。年份与作者规则直接调用官方局部检查函数，参考年份固定 2026，规则未命中统一输出 VALID@0.5；它们不是完整 prescreen/cascade。所有预测送出前先移除标签、错误类型、难度与解释字段。
 
@@ -60,7 +60,7 @@
 - 离线扩展覆盖两个完整公开划分，用于检验「分数是否来自类别比例、默认值或数据构造偏差」，不依赖网络。
 - `hallmark_official_doi_dev_reference.json` 是上游发布的全量参考汇总，只用于核对划分名称与指标字段，未混入本仓库的实测结果与统计计算。
 - 分层 bootstrap 固定标签比例，不反映标签比例本身的变化，也未处理同源扰动的组内相关性。
-- 九组实验图同时保存 PDF 与 PNG；绘图脚本只从 JSONL/JSON/CSV 读取结果，不在绘图阶段写入预测。三份 LaTeX 表格与正文关键宏由同一汇总生成，避免手抄数字。
+- 九组实验图以 220 dpi PNG 保存；绘图脚本只从 JSONL/JSON/CSV 读取结果，不在绘图阶段写入预测。论文表格与正文关键数值取自同一份汇总 JSON 和统计 CSV，避免手抄数字。
 - 未开展选做的自主改进任务，论文按「复现与分析」组织。
 
 ## 7. 复现步骤

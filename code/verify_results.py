@@ -87,16 +87,12 @@ def main() -> int:
         "smoke_actual_cases.csv",
         "smoke_threshold_analysis.csv",
         "ece_order_sensitivity.csv",
-        "extended_results.tex",
-        "baseline_table.tex",
-        "actual_cases_table.tex",
     ):
         check((RESULTS / name).is_file(), f"results/{name}", errors)
 
     print("== 实验图 ==")
     for stem in FIGURE_STEMS:
-        for suffix in (".pdf", ".png"):
-            check((FIGURES / f"{stem}{suffix}").is_file(), f"figures/{stem}{suffix}", errors)
+        check((FIGURES / f"{stem}.png").is_file(), f"figures/{stem}.png", errors)
 
     print("== 官方源码 ==")
     check((ROOT / "official" / "hallmark" / "dataset" / "loader.py").is_file(), "官方 hallmark 包完整", errors)
