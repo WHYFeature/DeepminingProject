@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# LaTeX intermediate outputs
+# NOTE: *.bbl is intentionally tracked so the paper compiles without Biber.
+*.aux
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+paper_src/course_paper.pdf
+
+# Local scratch
+tmp/
+*.tmp
+*.bak

@@ -1,0 +1,17 @@
+{
+  "body_cjk_characters_before": 4855,
+  "body_cjk_characters_after": 11574,
+  "body_expansion_ratio": 2.383934088568486,
+  "counting_scope": "Introduction through conclusion; excludes abstract, references, appendix and generated tables",
+  "pages_before": 9,
+  "pages_after": 21,
+  "layout_preserved": "A4, 11pt, 2.45cm margins",
+  "figures_in_paper": 9,
+  "prediction_files": 16,
+  "offline_predictions": 15600,
+  "extended_experiment_network_requests": 0,
+  "full_experiment_exit_code": 0,
+  "official_and_independent_metric_assertions": "passed during complete experiment run",
+  "xelatex_compile": "passed; no warnings, undefined references or overfull boxes",
+  "task3": "not performed"
+}

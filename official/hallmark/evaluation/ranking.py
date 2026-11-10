@@ -1,0 +1,510 @@
+"""Ranking tools using Plackett-Luce model for incomplete evaluation data.
+
+This module implements ranking for citation verification tools inspired by ONEBench's
+approach to handle heterogeneous and incomplete evaluation data. The Plackett-Luce
+model allows ranking tools even when not all tools have been evaluated on all entries.
+
+The implementation provides:
+- Results matrix construction from predictions and ground truth
+- Plackett-Luce ranking via the choix library (with fallback to mean scoring)
+- Simple mean-score ranking for comparison
+- Matrix serialization for reproducibility
+
+Handling Incomplete Evaluations:
+--------------------------------
+
+When tools have partial coverage (e.g., due to API rate limits, failures, or selective
+evaluation), the Plackett-Luce model enables fair ranking by:
+
+1. **Pairwise Comparisons**: For each benchmark entry, compare tools that both have
+   predictions for that entry. Tools are not penalized for missing entries.
+
+2. **Correctness Scoring**: Each prediction receives a confidence-weighted score:
+   - correct: score = confidence (rewards correct + high confidence)
+   - incorrect: score = 1 - confidence (partial credit for calibrated uncertainty)
+   - Applies uniformly to all entry types (HALLUCINATED and VALID)
+   - UNCERTAIN predictions are excluded (treated as missing, consistent with metrics.py)
+
+3. **ILSR Ranking**: Iterative Luce Spectral Ranking aggregates pairwise comparisons
+   into global tool rankings, accounting for varying coverage and difficulty.
+
+4. **Tie-breaking**: Exact ties use deterministic hash-based random assignment so
+   that all entry-pair comparisons contribute to the pairwise count.
+
+5. **Fallback**: If choix is unavailable or pairwise data is insufficient, falls back
+   to mean-score ranking on covered entries.
+
+Usage:
+------
+    # Single-tool evaluation (standard metrics)
+    result = evaluate(entries, predictions, tool_name="my_tool")
+
+    # Multi-tool ranking with partial coverage
+    tool_predictions = {
+        "tool_a": predictions_a,  # May cover different subsets
+        "tool_b": predictions_b,
+    }
+    rankings = rank_tools(entries, tool_predictions, method="plackett_luce")
+
+    # With bootstrap uncertainty
+    ranked, cis = rank_tools_plackett_luce(
+        entry_keys, tool_names, matrix, compute_ci=True
+    )
+    # cis["tool_a"] == (lower_95, upper_95)
+
+References:
+    ONEBench: https://github.com/bethgelab/onebench
+    Plackett-Luce model: Luce (1959), Plackett (1975)
+"""
+
+from __future__ import annotations
+
+import contextlib
+import csv
+import hashlib
+import logging
+from pathlib import Path
+from typing import Literal, overload
+
+from hallmark.dataset.schema import BenchmarkEntry, Prediction
+
+logger = logging.getLogger(__name__)
+
+
+def build_results_matrix(
+    entries: list[BenchmarkEntry],
+    tool_predictions: dict[str, list[Prediction]],
+) -> tuple[list[str], list[str], list[list[float | None]]]:
+    """Build entries x tools matrix of correctness scores.
+
+    For each entry-tool pair, computes a confidence-weighted correctness score:
+    - correct: score = confidence (rewards correct + high confidence)
+    - incorrect: score = 1 - confidence (partial credit for calibrated uncertainty)
+    - None if tool has no prediction for this entry
+
+    Scoring is symmetric across all entry types (HALLUCINATED and VALID).
+
+    Args:
+        entries: List of benchmark entries with ground truth labels
+        tool_predictions: Dict mapping tool names to their predictions
+
+    Returns:
+        Tuple of (entry_keys, tool_names, matrix) where:
+        - entry_keys: List of bibtex_key strings (row labels)
+        - tool_names: List of tool name strings (column labels)
+        - matrix: 2D list where matrix[i][j] is the correctness score of tool j
+          on entry i, or None if missing
+    """
+    # Build index mappings
+    entry_map = {entry.bibtex_key: entry for entry in entries}
+    entry_keys = [entry.bibtex_key for entry in entries]
+    tool_names = sorted(tool_predictions.keys())
+
+    # Build prediction lookup: tool -> bibtex_key -> prediction
+    pred_lookup: dict[str, dict[str, Prediction]] = {}
+    for tool_name, predictions in tool_predictions.items():
+        pred_lookup[tool_name] = {pred.bibtex_key: pred for pred in predictions}
+
+    # Build matrix
+    matrix: list[list[float | None]] = []
+    for entry_key in entry_keys:
+        entry = entry_map[entry_key]
+        row: list[float | None] = []
+
+        for tool_name in tool_names:
+            if entry_key not in pred_lookup[tool_name]:
+                row.append(None)
+                continue
+
+            pred = pred_lookup[tool_name][entry_key]
+
+            # Skip UNCERTAIN predictions (consistent with metrics.py exclusion)
+            if pred.label == "UNCERTAIN":
+                row.append(None)
+                continue
+
+            # Confidence-weighted scoring (symmetric across all entry types):
+            # correct: reward high confidence; incorrect: reward low confidence
+            is_correct = pred.label == entry.label
+            score = pred.confidence if is_correct else 1.0 - pred.confidence
+
+            row.append(score)
+
+        matrix.append(row)
+
+    return entry_keys, tool_names, matrix
+
+
+def _build_comparisons(
+    entry_keys: list[str],
+    tool_names: list[str],
+    matrix: list[list[float | None]],
+) -> list[tuple[int, int]]:
+    """Convert a results matrix into pairwise (winner, loser) index comparisons.
+
+    Used by both the point-estimate and bootstrap paths so the logic lives in
+    one place.
+    """
+    comparisons: list[tuple[int, int]] = []
+
+    for entry_key, row in zip(entry_keys, matrix, strict=True):
+        available_tools = [(idx, score) for idx, score in enumerate(row) if score is not None]
+
+        if len(available_tools) < 2:
+            continue
+
+        for i in range(len(available_tools)):
+            for j in range(i + 1, len(available_tools)):
+                idx_i, score_i = available_tools[i]
+                idx_j, score_j = available_tools[j]
+
+                tool_a = tool_names[idx_i]
+                tool_b = tool_names[idx_j]
+
+                if score_i > score_j + 1e-9:
+                    comparisons.append((idx_i, idx_j))
+                elif score_j > score_i + 1e-9:
+                    comparisons.append((idx_j, idx_i))
+                else:
+                    # Exact tie: deterministic hash-based random assignment.
+                    # On average carries no information (50/50) but preserves
+                    # the pairwise comparison count for all entry types.
+                    tie_seed = hashlib.sha256(f"{entry_key}:{tool_a}:{tool_b}".encode()).digest()[0]
+                    if tie_seed % 2 == 0:
+                        comparisons.append((idx_i, idx_j))
+                    else:
+                        comparisons.append((idx_j, idx_i))
+
+    return comparisons
+
+
+@overload
+def rank_tools_plackett_luce(
+    entry_keys: list[str],
+    tool_names: list[str],
+    matrix: list[list[float | None]],
+    alpha: float = ...,
+    n_bootstrap: int = ...,
+    seed: int = ...,
+    compute_ci: Literal[False] = ...,
+) -> list[tuple[str, float]]: ...
+
+
+@overload
+def rank_tools_plackett_luce(
+    entry_keys: list[str],
+    tool_names: list[str],
+    matrix: list[list[float | None]],
+    alpha: float = ...,
+    n_bootstrap: int = ...,
+    seed: int = ...,
+    compute_ci: Literal[True] = ...,
+) -> tuple[list[tuple[str, float]], dict[str, tuple[float, float]]]: ...
+
+
+def rank_tools_plackett_luce(
+    entry_keys: list[str],
+    tool_names: list[str],
+    matrix: list[list[float | None]],
+    alpha: float = 0.01,
+    n_bootstrap: int = 1000,
+    seed: int = 42,
+    compute_ci: bool = False,
+) -> list[tuple[str, float]] | tuple[list[tuple[str, float]], dict[str, tuple[float, float]]]:
+    """Rank tools using Plackett-Luce model via choix library.
+
+    Converts the results matrix into pairwise comparisons and estimates tool
+    parameters using iterative Luce spectral ranking (ILSR). Handles sparse and
+    incomplete data gracefully.
+
+    Tied scores use deterministic hash-based tie-breaking so all entry-pair
+    comparisons contribute to the pairwise count.
+
+    Falls back to mean-score ranking if choix is not installed.
+
+    Args:
+        entry_keys: List of entry identifiers (row labels)
+        tool_names: List of tool names (column labels)
+        matrix: Results matrix where matrix[i][j] is correctness of tool j on entry i
+        alpha: L2 regularization parameter for ILSR (default: 0.01)
+        n_bootstrap: Number of bootstrap resamples for CI estimation (default: 1000).
+            Only used when compute_ci=True.
+        seed: Random seed for bootstrap resampling (default: 42).
+            Only used when compute_ci=True.
+        compute_ci: If True, also return 95% bootstrap CIs for each tool's score.
+            Default False preserves the original return type.
+
+    Returns:
+        When compute_ci=False (default):
+            List of (tool_name, score) tuples sorted descending by score.
+            Scores are normalized probabilities summing to 1.
+        When compute_ci=True:
+            Tuple of (ranked, score_ci) where:
+            - ranked: same list as above
+            - score_ci: dict mapping tool name to (lower_95, upper_95) CI tuple.
+              CI is None for a tool if the bootstrap failed for that tool.
+    """
+    try:
+        import choix
+        import numpy as np
+    except ImportError:
+        logger.warning(
+            "choix library not installed. Install with 'pip install choix'. "
+            "Falling back to mean-score ranking."
+        )
+        fallback = rank_tools_mean_score(entry_keys, tool_names, matrix)
+        if compute_ci:
+            empty_ci: dict[str, tuple[float, float]] = {}
+            return fallback, empty_ci
+        return fallback
+
+    n_tools = len(tool_names)
+    n_entries = len(entry_keys)
+
+    # Build point-estimate pairwise comparisons
+    comparisons = _build_comparisons(entry_keys, tool_names, matrix)
+
+    if not comparisons:
+        logger.warning("No pairwise comparisons available. Falling back to mean-score ranking.")
+        fallback = rank_tools_mean_score(entry_keys, tool_names, matrix)
+        if compute_ci:
+            empty_ci = {}
+            return fallback, empty_ci
+        return fallback
+
+    # Estimate point-estimate parameters using ILSR
+    _ILSR_ERRORS: tuple[type[Exception], ...] = (ValueError, RuntimeError)
+    with contextlib.suppress(AttributeError):
+        _ILSR_ERRORS = (*_ILSR_ERRORS, np.linalg.LinAlgError)
+
+    try:
+        log_params = choix.ilsr_pairwise(n_tools, comparisons, alpha=alpha)
+    except _ILSR_ERRORS as e:
+        logger.error(f"ILSR failed: {e}. Falling back to mean-score ranking.")
+        fallback = rank_tools_mean_score(entry_keys, tool_names, matrix)
+        if compute_ci:
+            empty_ci = {}
+            return fallback, empty_ci
+        return fallback
+
+    # Convert log-parameters to normalized probabilities
+    params = np.exp(log_params)
+    params = params / params.sum()
+
+    # Sort by score descending
+    ranked = sorted(
+        [(tool_names[idx], float(params[idx])) for idx in range(n_tools)],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    if not compute_ci:
+        return ranked
+
+    # Bootstrap uncertainty estimation
+    # boot_scores[tool_idx] accumulates one score per successful bootstrap iteration
+    boot_scores: list[list[float]] = [[] for _ in range(n_tools)]
+
+    rng = np.random.default_rng(seed)
+
+    # Convert matrix rows to a numpy array of object dtype for easy resampling
+    matrix_np = np.array(matrix, dtype=object)  # shape (n_entries, n_tools)
+
+    try:
+        for _ in range(n_bootstrap):
+            # Resample rows (entries) with replacement
+            indices = rng.integers(0, n_entries, size=n_entries)
+            resampled_keys = [entry_keys[i] for i in indices]
+            resampled_matrix: list[list[float | None]] = matrix_np[indices].tolist()
+
+            boot_comparisons = _build_comparisons(resampled_keys, tool_names, resampled_matrix)
+
+            if not boot_comparisons:
+                continue  # Skip degenerate resample
+
+            try:
+                boot_log_params = choix.ilsr_pairwise(n_tools, boot_comparisons, alpha=alpha)
+            except Exception:
+                continue  # Skip failed resample
+
+            boot_params = np.exp(boot_log_params)
+            boot_params = boot_params / boot_params.sum()
+
+            for t in range(n_tools):
+                boot_scores[t].append(float(boot_params[t]))
+
+    except Exception as e:
+        logger.warning(f"Bootstrap CI estimation failed: {e}. Returning empty CIs.")
+        score_ci: dict[str, tuple[float, float]] = {}
+        return ranked, score_ci
+
+    # Compute 95% CIs from bootstrap distribution
+    score_ci = {}
+    for t, tool_name in enumerate(tool_names):
+        samples = boot_scores[t]
+        if len(samples) < 2:
+            logger.warning(
+                f"Too few successful bootstrap samples for '{tool_name}' "
+                f"({len(samples)}); CI not available."
+            )
+            continue
+        arr = np.array(samples)
+        lower = float(np.percentile(arr, 2.5))
+        upper = float(np.percentile(arr, 97.5))
+        score_ci[tool_name] = (lower, upper)
+
+    return ranked, score_ci
+
+
+def rank_tools_mean_score(
+    entry_keys: list[str],
+    tool_names: list[str],
+    matrix: list[list[float | None]],
+) -> list[tuple[str, float]]:
+    """Rank tools by mean correctness score.
+
+    Computes the average correctness score for each tool across all entries
+    where it has predictions. Missing entries are ignored.
+
+    Args:
+        entry_keys: List of entry identifiers (row labels)
+        tool_names: List of tool names (column labels)
+        matrix: Results matrix where matrix[i][j] is correctness of tool j on entry i
+
+    Returns:
+        List of (tool_name, mean_score) tuples sorted descending by mean_score.
+    """
+    tool_scores: list[tuple[str, float]] = []
+
+    for j, tool_name in enumerate(tool_names):
+        scores: list[float] = [s for i in range(len(entry_keys)) if (s := matrix[i][j]) is not None]
+
+        mean_score = 0.0 if not scores else sum(scores) / len(scores)
+
+        tool_scores.append((tool_name, mean_score))
+
+    # Sort descending
+    tool_scores.sort(key=lambda x: x[1], reverse=True)
+
+    return tool_scores
+
+
+def rank_tools(
+    entries: list[BenchmarkEntry],
+    tool_predictions: dict[str, list[Prediction]],
+    method: Literal["auto", "plackett_luce", "mean"] = "auto",
+    alpha: float = 0.01,
+) -> list[tuple[str, float]]:
+    """Rank citation verification tools on benchmark entries.
+
+    Main entry point for tool ranking. Builds the results matrix and applies
+    the specified ranking method.
+
+    Args:
+        entries: List of benchmark entries with ground truth
+        tool_predictions: Dict mapping tool names to their predictions
+        method: Ranking method - "plackett_luce", "mean", or "auto" (default).
+            "auto" uses Plackett-Luce if choix is available, else mean-score.
+        alpha: L2 regularization for Plackett-Luce (default: 0.01)
+
+    Returns:
+        List of (tool_name, score) tuples sorted descending by score.
+
+    Raises:
+        ValueError: If method is not one of the supported options.
+    """
+    if method not in {"auto", "plackett_luce", "mean"}:
+        raise ValueError(
+            f"Unknown ranking method: {method}. Use 'auto', 'plackett_luce', or 'mean'."
+        )
+
+    # Build results matrix
+    entry_keys, tool_names, matrix = build_results_matrix(entries, tool_predictions)
+
+    # Apply ranking method
+    if method == "mean":
+        return rank_tools_mean_score(entry_keys, tool_names, matrix)
+    elif method == "plackett_luce":
+        return rank_tools_plackett_luce(entry_keys, tool_names, matrix, alpha=alpha)
+    else:  # auto
+        # Try Plackett-Luce, will auto-fallback to mean if choix unavailable
+        return rank_tools_plackett_luce(entry_keys, tool_names, matrix, alpha=alpha)
+
+
+def save_results_matrix(
+    entry_keys: list[str],
+    tool_names: list[str],
+    matrix: list[list[float | None]],
+    path: str | Path,
+) -> None:
+    """Save results matrix as CSV for reproducibility.
+
+    The CSV has entry keys as the first column and tool names as column headers.
+
+    Args:
+        entry_keys: List of entry identifiers (row labels)
+        tool_names: List of tool names (column labels)
+        matrix: Results matrix where matrix[i][j] is correctness of tool j on entry i
+        path: Output CSV file path
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+
+        # Header row
+        writer.writerow(["entry_key", *tool_names])
+
+        # Data rows
+        for i, entry_key in enumerate(entry_keys):
+            row = [entry_key]
+            for j in range(len(tool_names)):
+                value = matrix[i][j]
+                row.append("" if value is None else f"{value:.4f}")
+            writer.writerow(row)
+
+    logger.info(f"Saved results matrix to {path}")
+
+
+def load_results_matrix(
+    path: str | Path,
+) -> tuple[list[str], list[str], list[list[float | None]]]:
+    """Load results matrix from CSV.
+
+    Args:
+        path: Input CSV file path (created by save_results_matrix)
+
+    Returns:
+        Tuple of (entry_keys, tool_names, matrix)
+    """
+    path = Path(path)
+
+    with path.open("r", newline="") as f:
+        reader = csv.reader(f)
+
+        # Read header
+        header = next(reader)
+        tool_names = header[1:]  # Skip "entry_key" column
+
+        # Read data rows
+        entry_keys: list[str] = []
+        matrix: list[list[float | None]] = []
+
+        for row in reader:
+            entry_keys.append(row[0])
+            matrix_row: list[float | None] = []
+
+            for value in row[1:]:
+                if value == "":
+                    matrix_row.append(None)
+                else:
+                    matrix_row.append(float(value))
+
+            matrix.append(matrix_row)
+
+    logger.info(
+        f"Loaded results matrix from {path} ({len(entry_keys)} entries x {len(tool_names)} tools)"
+    )
+
+    return entry_keys, tool_names, matrix

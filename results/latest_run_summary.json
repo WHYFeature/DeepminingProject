@@ -1,0 +1,337 @@
+{
+  "audits": {
+    "dev_public": {
+      "count": 1119,
+      "labels": {
+        "HALLUCINATED": 606,
+        "VALID": 513
+      },
+      "hallucination_tiers": {
+        "3": 179,
+        "2": 279,
+        "1": 148
+      },
+      "types": {
+        "plausible_fabrication": 78,
+        "near_miss_title": 52,
+        "merged_citation": 30,
+        "valid": 513,
+        "arxiv_version_mismatch": 49,
+        "chimeric_title": 47,
+        "future_date": 30,
+        "wrong_venue": 47,
+        "partial_author_list": 32,
+        "swapped_authors": 67,
+        "placeholder_authors": 41,
+        "preprint_as_published": 30,
+        "fabricated_doi": 38,
+        "nonexistent_venue": 39,
+        "hybrid_fabrication": 26
+      },
+      "generation_methods": {
+        "real_world": 46,
+        "llm_generated": 113,
+        "perturbation": 414,
+        "adversarial": 60,
+        "scraped": 486
+      },
+      "field_audit": {
+        "VALID": {
+          "count": 513,
+          "doi_present": 241,
+          "title_missing": 0,
+          "author_missing": 0,
+          "year_missing": 0,
+          "venue_missing": 22
+        },
+        "HALLUCINATED": {
+          "count": 606,
+          "doi_present": 313,
+          "title_missing": 0,
+          "author_missing": 0,
+          "year_missing": 0,
+          "venue_missing": 61
+        }
+      },
+      "duplicate_title_groups": 228,
+      "entries_in_duplicate_title_groups": 570,
+      "duplicate_doi_groups": 119
+    },
+    "test_public": {
+      "count": 831,
+      "labels": {
+        "HALLUCINATED": 519,
+        "VALID": 312
+      },
+      "hallucination_tiers": {
+        "1": 128,
+        "2": 238,
+        "3": 153
+      },
+      "types": {
+        "future_date": 29,
+        "partial_author_list": 31,
+        "chimeric_title": 23,
+        "valid": 312,
+        "preprint_as_published": 29,
+        "placeholder_authors": 33,
+        "fabricated_doi": 29,
+        "swapped_authors": 63,
+        "plausible_fabrication": 68,
+        "arxiv_version_mismatch": 45,
+        "merged_citation": 29,
+        "nonexistent_venue": 37,
+        "wrong_venue": 34,
+        "near_miss_title": 40,
+        "hybrid_fabrication": 29
+      },
+      "generation_methods": {
+        "perturbation": 361,
+        "llm_generated": 90,
+        "scraped": 287,
+        "real_world": 34,
+        "adversarial": 59
+      },
+      "field_audit": {
+        "VALID": {
+          "count": 312,
+          "doi_present": 139,
+          "title_missing": 0,
+          "author_missing": 0,
+          "year_missing": 0,
+          "venue_missing": 13
+        },
+        "HALLUCINATED": {
+          "count": 519,
+          "doi_present": 245,
+          "title_missing": 0,
+          "author_missing": 0,
+          "year_missing": 0,
+          "venue_missing": 35
+        }
+      },
+      "duplicate_title_groups": 184,
+      "entries_in_duplicate_title_groups": 492,
+      "duplicate_doi_groups": 84
+    },
+    "stress_test": {
+      "count": 121,
+      "labels": {
+        "HALLUCINATED": 121
+      },
+      "hallucination_tiers": {
+        "3": 36,
+        "2": 85
+      },
+      "types": {
+        "arxiv_version_mismatch": 36,
+        "merged_citation": 46,
+        "partial_author_list": 39
+      },
+      "generation_methods": {
+        "perturbation": 121
+      },
+      "field_audit": {
+        "VALID": {
+          "count": 0,
+          "doi_present": 0,
+          "title_missing": 0,
+          "author_missing": 0,
+          "year_missing": 0,
+          "venue_missing": 0
+        },
+        "HALLUCINATED": {
+          "count": 121,
+          "doi_present": 81,
+          "title_missing": 0,
+          "author_missing": 0,
+          "year_missing": 0,
+          "venue_missing": 0
+        }
+      },
+      "duplicate_title_groups": 16,
+      "entries_in_duplicate_title_groups": 34,
+      "duplicate_doi_groups": 10
+    },
+    "cross_split": {
+      "exact_normalized_title_overlap": 1,
+      "normalized_doi_overlap": 2
+    }
+  },
+  "doi_presence": {
+    "dev_public": {
+      "tp": 293,
+      "fp": 272,
+      "tn": 241,
+      "fn": 313,
+      "detection_rate": 0.4834983498349835,
+      "false_positive_rate": 0.530214424951267,
+      "precision": 0.5185840707964602,
+      "f1": 0.5004269854824936,
+      "macro_f1": 0.4760804093298129,
+      "mcc": -0.046556705046763174,
+      "ece_fixed_width": 0.22377122430741736,
+      "coverage": 1.0
+    },
+    "test_public": {
+      "tp": 274,
+      "fp": 173,
+      "tn": 139,
+      "fn": 245,
+      "detection_rate": 0.5279383429672447,
+      "false_positive_rate": 0.5544871794871795,
+      "precision": 0.6129753914988815,
+      "f1": 0.567287784679089,
+      "macro_f1": 0.48335653601770545,
+      "mcc": -0.025786185077137702,
+      "ece_fixed_width": 0.210589651022864,
+      "coverage": 1.0
+    }
+  },
+  "year_author": {
+    "dev_public": {
+      "tp": 30,
+      "fp": 0,
+      "tn": 513,
+      "fn": 576,
+      "detection_rate": 0.04950495049504951,
+      "false_positive_rate": 0.0,
+      "precision": 1.0,
+      "f1": 0.09433962264150944,
+      "macro_f1": 0.3673945304218783,
+      "mcc": 0.15271055585508414,
+      "ece_fixed_width": 0.02949061662198393,
+      "coverage": 1.0
+    },
+    "test_public": {
+      "tp": 29,
+      "fp": 0,
+      "tn": 312,
+      "fn": 490,
+      "detection_rate": 0.055876685934489405,
+      "false_positive_rate": 0.0,
+      "precision": 1.0,
+      "f1": 0.10583941605839416,
+      "macro_f1": 0.33299152131465487,
+      "mcc": 0.14743664268233075,
+      "ece_fixed_width": 0.10884476534296032,
+      "coverage": 1.0
+    }
+  },
+  "smoke": {
+    "metrics": {
+      "tp": 2,
+      "fp": 0,
+      "tn": 9,
+      "fn": 9,
+      "detection_rate": 0.18181818181818182,
+      "false_positive_rate": 0.0,
+      "precision": 1.0,
+      "f1": 0.3076923076923077,
+      "macro_f1": 0.48717948717948717,
+      "mcc": 0.30151134457776363,
+      "ece_fixed_width": 0.06,
+      "coverage": 1.0,
+      "ece_adaptive_official": 0.26
+    },
+    "ece_order_sensitivity": {
+      "adaptive_ece": {
+        "min": 0.06,
+        "max": 0.45999999999999996,
+        "mean": 0.239
+      },
+      "fixed_width_ece": {
+        "min": 0.06,
+        "max": 0.06,
+        "mean": 0.06
+      }
+    },
+    "evidence_counts": {
+      "indeterminate": 2,
+      "not_checked_no_doi": 14,
+      "not_found": 2,
+      "resolved": 2
+    },
+    "effective_evidence_coverage": 0.2,
+    "api_query_coverage": 0.3,
+    "threshold_analysis": [
+      {
+        "minimum_confidence": 0.5,
+        "retained": 20,
+        "coverage": 1.0,
+        "accuracy": 0.55,
+        "f1": 0.3076923076923077,
+        "detection_rate": 0.18181818181818182,
+        "false_positive_rate": 0.0
+      },
+      {
+        "minimum_confidence": 0.6,
+        "retained": 4,
+        "coverage": 0.2,
+        "accuracy": 0.75,
+        "f1": 0.8,
+        "detection_rate": 0.6666666666666666,
+        "false_positive_rate": 0.0
+      },
+      {
+        "minimum_confidence": 0.75,
+        "retained": 4,
+        "coverage": 0.2,
+        "accuracy": 0.75,
+        "f1": 0.8,
+        "detection_rate": 0.6666666666666666,
+        "false_positive_rate": 0.0
+      },
+      {
+        "minimum_confidence": 0.85,
+        "retained": 2,
+        "coverage": 0.1,
+        "accuracy": 0.5,
+        "f1": 0.0,
+        "detection_rate": 0.0,
+        "false_positive_rate": 0.0
+      },
+      {
+        "minimum_confidence": 0.9,
+        "retained": 0,
+        "coverage": 0.0,
+        "accuracy": null,
+        "f1": 0.0,
+        "detection_rate": 0.0,
+        "false_positive_rate": 0.0
+      }
+    ],
+    "independent_stratified_bootstrap": {
+      "detection_rate": {
+        "point": 0.18181818181818182,
+        "ci_lower": 0.0,
+        "ci_upper": 0.45454545454545453
+      },
+      "false_positive_rate": {
+        "point": 0.0,
+        "ci_lower": 0.0,
+        "ci_upper": 0.0
+      },
+      "f1": {
+        "point": 0.3076923076923077,
+        "ci_lower": 0.0,
+        "ci_upper": 0.625
+      },
+      "mcc": {
+        "point": 0.30151134457776363,
+        "ci_lower": 0.0,
+        "ci_upper": 0.5222329678670935
+      },
+      "ece_fixed_width": {
+        "point": 0.06,
+        "ci_lower": 0.025,
+        "ci_upper": 0.2325
+      },
+      "ece_adaptive_official": {
+        "point": 0.26,
+        "ci_lower": 0.36500000000000005,
+        "ci_upper": 0.52
+      }
+    }
+  }
+}

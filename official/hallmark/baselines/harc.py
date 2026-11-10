@@ -1,0 +1,342 @@
+"""Baseline wrapper for HaRC (Hallucinated Reference Checker).
+
+HaRC (https://pypi.org/project/harcx/) validates BibTeX citations against
+Semantic Scholar, DBLP, Google Scholar, and Open Library.
+
+Install: pipx install harcx  (or uv tool install harcx)
+
+NOTE: harcx requires bibtexparser 1.x which conflicts with hallmark's
+bibtexparser>=2.0.  It must be installed in an isolated environment
+(pipx / uv tool) and invoked as a CLI subprocess.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+from hallmark.baselines.common import fallback_predictions, run_with_prescreening
+from hallmark.dataset.schema import BlindEntry, Prediction
+
+logger = logging.getLogger(__name__)
+
+API_SOURCES = ["semantic_scholar", "dblp", "google_scholar", "open_library"]
+
+# Known false-positive patterns in harcx output
+FALSE_POSITIVE_PATTERNS = [
+    "could not verify",
+    "could not find",
+    "api error",
+    "timeout",
+    "rate limit",
+]
+
+
+def _is_likely_false_positive(issues: list[str]) -> bool:
+    """Check if issues are likely false positives.
+
+    Single-issue flags that match common transient errors or API failures
+    are considered likely false positives.
+    """
+    if len(issues) > 1:
+        return False  # Multiple issues = likely real
+    issue_lower = issues[0].lower()
+    return any(pattern in issue_lower for pattern in FALSE_POSITIVE_PATTERNS)
+
+
+def _parse_harcx_output(output: str) -> dict[str, list[str]]:
+    """Parse harcx CLI output into a dict of {bibtex_key: [issues]}.
+
+    The CLI output format for flagged entries is::
+
+        [bibtex_key]
+          Title: ...
+          ...
+          Issue: description
+
+    Returns an empty dict when all entries are verified successfully.
+    """
+    flagged: dict[str, list[str]] = {}
+    current_key: str | None = None
+
+    for line in output.splitlines():
+        # Match entry key lines like "[fake_entry_2024]"
+        key_match = re.match(r"^\[(\S+)\]$", line.strip())
+        if key_match:
+            current_key = key_match.group(1)
+            continue
+
+        # Match issue lines like "  Issue: ..."
+        issue_match = re.match(r"^\s+Issue:\s+(.+)$", line)
+        if issue_match and current_key:
+            flagged.setdefault(current_key, []).append(issue_match.group(1))
+
+    return flagged
+
+
+def _run_harcx_batch(
+    harcx_bin: str,
+    batch: list[BlindEntry],
+    author_threshold: float,
+    check_urls: bool,
+    api_key: str | None,
+    timeout: float,
+) -> tuple[dict[str, list[str]], set[str], bool]:
+    """Run harcx on a batch of entries.
+
+    Returns:
+        (flagged_keys, checked_keys, timed_out)
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".bib", delete=False) as f:
+        for entry in batch:
+            f.write(entry.to_bibtex() + "\n\n")
+        bib_path = f.name
+
+    cmd = [harcx_bin, "-q", "--threshold", str(author_threshold), bib_path]
+    if check_urls:
+        cmd.append("--check-urls")
+    if api_key:
+        cmd.extend(["--api-key", api_key])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {}, set(), True
+    finally:
+        Path(bib_path).unlink(missing_ok=True)
+
+    combined_output = result.stdout + result.stderr
+    flagged = _parse_harcx_output(combined_output)
+
+    if result.returncode not in (0, 1):
+        logger.warning("harcx exited with code %d: %s", result.returncode, combined_output[:500])
+
+    checked = {e.bibtex_key for e in batch}
+    return flagged, checked, False
+
+
+def run_harc(
+    entries: list[BlindEntry],
+    author_threshold: float = 0.6,
+    check_urls: bool = False,
+    api_key: str | None = None,
+    batch_size: int = 20,
+    batch_timeout: float = 600.0,
+    total_timeout: float = 600.0,
+    skip_prescreening: bool = False,
+    **_kw: object,
+) -> list[Prediction]:
+    """Run HaRC verification on benchmark entries via the harcx CLI.
+
+    Processes entries in batches to collect partial results on timeout.
+    Each batch has its own timeout; completed batches are preserved even
+    if later batches time out.
+
+    Pre-screening (DOI check, year bounds, author heuristics) runs before
+    harcx to catch obvious hallucinations early, then results are merged.
+
+    Args:
+        entries: Benchmark entries to verify.
+        author_threshold: Author match threshold (0.0-1.0, default: 0.6).
+        check_urls: Whether to verify URL reachability.
+        api_key: Optional Semantic Scholar API key.
+        batch_size: Entries per batch (default: 20).
+        batch_timeout: Timeout per batch in seconds (default: 600).
+        total_timeout: Total wall-clock limit across all batches (default: 600).
+        skip_prescreening: Skip pre-screening checks (default: False).
+
+    Returns:
+        List of Predictions.
+    """
+    # Fall back to the environment for the Semantic Scholar key, matching
+    # bibtexupdater.py. Without this the registry passed no api_key while the
+    # co-designed tool read S2_API_KEY for itself, so a default side-by-side run
+    # on a machine with the key handed one tool authenticated access and its
+    # competitor the unauthenticated pool -- and HaRC was then excluded from the
+    # main table for the throttling that asymmetry produced.
+    if api_key is None:
+        api_key = os.environ.get("S2_API_KEY")
+
+    harcx_bin = shutil.which("harcx")
+    if harcx_bin is None:
+        logger.error(
+            "harcx CLI not found on PATH. "
+            "Install with: pipx install harcx  (or uv tool install harcx)"
+        )
+        return fallback_predictions(entries, reason="Fallback: harcx unavailable")
+
+    def _run_tool(tool_entries: list[BlindEntry]) -> list[Prediction]:
+        return _run_harc_batches(
+            tool_entries,
+            harcx_bin=harcx_bin,
+            author_threshold=author_threshold,
+            check_urls=check_urls,
+            api_key=api_key,
+            batch_size=batch_size,
+            batch_timeout=batch_timeout,
+            total_timeout=total_timeout,
+        )
+
+    return run_with_prescreening(
+        entries,
+        _run_tool,
+        skip_prescreening=skip_prescreening,
+        backfill_reason="HaRC: entry not checked (timeout or missing)",
+    )
+
+
+def _run_harc_batches(
+    entries: list[BlindEntry],
+    harcx_bin: str,
+    author_threshold: float,
+    check_urls: bool,
+    api_key: str | None,
+    batch_size: int,
+    batch_timeout: float,
+    total_timeout: float,
+) -> list[Prediction]:
+    """Run harcx in batches and return raw predictions (no pre-screening).
+
+    Returns only the entries harcx actually checked, so a run whose batches all
+    timed out returns an empty list. That is honest at this level and is NOT
+    marked ``evaluated=False``: this function has no basis for a claim about
+    entries it never saw. The all-VALID set that a caller would otherwise score
+    is manufactured one level up, in ``run_with_prescreening``, and that is where
+    the backfill carries the flag.
+    """
+    start = time.time()
+    all_flagged: dict[str, list[str]] = {}
+    all_checked: set[str] = set()
+    timed_out_batches = 0
+    total_batches = (len(entries) + batch_size - 1) // batch_size
+
+    for i in range(0, len(entries), batch_size):
+        elapsed_so_far = time.time() - start
+        remaining = total_timeout - elapsed_so_far
+        if remaining <= 0:
+            logger.warning(
+                f"HaRC total timeout ({total_timeout}s) reached after "
+                f"{len(all_checked)}/{len(entries)} entries"
+            )
+            break
+
+        batch = entries[i : i + batch_size]
+        batch_num = i // batch_size + 1
+        logger.info(f"HaRC batch {batch_num}/{total_batches}: {len(batch)} entries")
+
+        # Use the lesser of batch_timeout and remaining total time
+        effective_timeout = min(batch_timeout, remaining)
+        flagged, checked, timed_out = _run_harcx_batch(
+            harcx_bin, batch, author_threshold, check_urls, api_key, effective_timeout
+        )
+
+        if timed_out:
+            timed_out_batches += 1
+            logger.warning(
+                f"HaRC batch {batch_num}/{total_batches} timed out after {effective_timeout}s"
+            )
+            break  # Stop processing further batches
+
+        all_flagged.update(flagged)
+        all_checked.update(checked)
+
+    total_time = time.time() - start
+    per_entry_time = total_time / max(len(entries), 1)
+    checked_count = len(all_checked)
+
+    if timed_out_batches:
+        logger.warning(
+            f"HaRC completed {checked_count}/{len(entries)} entries "
+            f"before timeout ({timed_out_batches} batch(es) timed out)"
+        )
+
+    # A run that checked NOTHING is not a measurement, and must not be able to
+    # look like one. Every unchecked entry is backfilled downstream, so a total
+    # hang emerges as an all-VALID prediction set scoring DR 0.0 / FPR 0.0 with
+    # zero API calls -- indistinguishable from a tool that ran fine and flagged
+    # nothing. Four such files shipped as pre-screening ablations.
+    #
+    # The cause is not always a missing binary. harcx queries Google Scholar via
+    # ``scholarly``, which Scholar blocks aggressively and the library retries
+    # rather than failing, so a single entry can exceed 150s. At batch_size 20
+    # every batch then exceeds batch_timeout, every batch contributes an empty
+    # ``checked`` set, and the run lands at zero having made real HTTP requests
+    # during pre-screening -- which is why the failure reads as a clean result.
+    if entries and checked_count == 0:
+        # Every entry will be backfilled, and every backfill carries
+        # evaluated=False, so the run reports num_evaluated 0, evaluate() logs
+        # it at ERROR, and `hallmark evaluate --output` refuses to write it
+        # unless --allow-null-run is passed. Log loudly and return: the
+        # predictions are still wanted by callers that want to see the shape of
+        # the failure, and refusing outright would also discard a partial run.
+        logger.error(
+            "HaRC checked 0 of %d entries (%d batch(es) timed out). Every "
+            "prediction is a backfill, so detection rate and false positive "
+            "rate would be artefacts of the tool not running. Reduce "
+            "--batch-size, raise batch_timeout, or record HaRC as not evaluable "
+            "on this machine.",
+            len(entries),
+            timed_out_batches,
+        )
+
+    # Map to predictions
+    predictions: list[Prediction] = []
+
+    for entry in entries:
+        if entry.bibtex_key not in all_checked:
+            continue  # Will be backfilled by run_with_prescreening
+
+        issues = all_flagged.get(entry.bibtex_key, [])
+        if issues:
+            # Check for false positive patterns
+            if _is_likely_false_positive(issues):
+                predictions.append(
+                    Prediction(
+                        bibtex_key=entry.bibtex_key,
+                        label="VALID",
+                        confidence=0.60,
+                        reason=f"HaRC: flagged but likely false positive: {'; '.join(issues)}",
+                        api_sources_queried=API_SOURCES,
+                        wall_clock_seconds=per_entry_time,
+                        api_calls=len(API_SOURCES),
+                    )
+                )
+            else:
+                # Real issue(s): calibrate confidence based on issue count
+                confidence = min(0.4 + 0.2 * len(issues), 0.95) if len(issues) >= 2 else 0.55
+                predictions.append(
+                    Prediction(
+                        bibtex_key=entry.bibtex_key,
+                        label="HALLUCINATED",
+                        confidence=confidence,
+                        reason=f"HaRC flagged: {'; '.join(issues)}",
+                        api_sources_queried=API_SOURCES,
+                        wall_clock_seconds=per_entry_time,
+                        api_calls=len(API_SOURCES),
+                    )
+                )
+        else:
+            predictions.append(
+                Prediction(
+                    bibtex_key=entry.bibtex_key,
+                    label="VALID",
+                    confidence=0.85,
+                    reason="HaRC: No issues found across databases",
+                    api_sources_queried=API_SOURCES,
+                    wall_clock_seconds=per_entry_time,
+                    api_calls=len(API_SOURCES),
+                )
+            )
+
+    return predictions

@@ -1,0 +1,1038 @@
+"""Baseline registry: single source of truth for all HALLMARK baselines.
+
+Provides discovery, availability checking, and dispatch for all baselines.
+"""
+
+from __future__ import annotations
+
+import importlib
+import logging
+import os
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from hallmark.baselines.common import fallback_predictions
+from hallmark.dataset.schema import BenchmarkEntry, BlindEntry, Prediction
+
+if TYPE_CHECKING:
+    from hallmark.baselines.bibtexupdater import BibtexCheckRun
+
+logger = logging.getLogger(__name__)
+
+# Re-export BlindEntry so callers can import it from this module.
+__all__ = [
+    "BaselineInfo",
+    "BlindEntry",
+    "check_available",
+    "get_registry",
+    "list_baselines",
+    "register",
+    "requires_single_worker",
+    "run_baseline",
+    "run_baseline_with_tool_run",
+]
+
+
+def _to_blind(entries: list[BenchmarkEntry]) -> list[BlindEntry]:
+    """Convert BenchmarkEntry list to BlindEntry list, hiding ground-truth labels."""
+    return [e.to_blind() for e in entries]
+
+
+@dataclass
+class BaselineInfo:
+    """Metadata and runner for a single baseline."""
+
+    name: str
+    description: str
+    runner: Callable[..., list[Prediction]]
+    # pip package(s) required — checked via import (empty = no extra deps)
+    pip_packages: list[str] = field(default_factory=list)
+    # CLI commands to check on PATH (for subprocess-based baselines)
+    cli_commands: list[str] = field(default_factory=list)
+    # Whether an API key or paid service is needed
+    requires_api_key: bool = False
+    # Environment variable name holding the API key (checked in check_available)
+    env_var: str | None = None
+    # Whether this baseline is free to run (no API costs)
+    is_free: bool = True
+    # Extra kwargs accepted by the runner
+    runner_kwargs: dict[str, Any] = field(default_factory=dict)
+    # How confidence scores are produced: "probabilistic" (LLM self-reported),
+    # "heuristic" (rule-based), "binary" (fixed 0/1 values only)
+    confidence_type: str = "heuristic"
+
+
+# Global registry
+_REGISTRY: dict[str, BaselineInfo] = {}
+
+
+def register(info: BaselineInfo) -> None:
+    """Register a baseline."""
+    if info.name in _REGISTRY:
+        logger.warning("Overwriting existing baseline %r", info.name)
+    _REGISTRY[info.name] = info
+
+
+def get_registry() -> dict[str, BaselineInfo]:
+    """Return the full registry (read-only copy)."""
+    return dict(_REGISTRY)
+
+
+def list_baselines(*, free_only: bool = False) -> list[str]:
+    """List registered baseline names."""
+    if free_only:
+        return [name for name, info in _REGISTRY.items() if info.is_free]
+    return list(_REGISTRY.keys())
+
+
+def requires_single_worker(name: str, info: BaselineInfo) -> bool:
+    """True for baselines whose runner directly owns a CLI subprocess."""
+    return bool(info.cli_commands) and not name.startswith("llm_")
+
+
+def check_available(name: str) -> tuple[bool, str]:
+    """Check if a baseline's dependencies are installed.
+
+    For CLI-based baselines, checks that the command exists on PATH.
+    For library-based baselines, checks that the Python module is importable.
+
+    Returns:
+        (available, message) tuple.
+    """
+    import shutil
+
+    if name not in _REGISTRY:
+        return False, f"Unknown baseline: {name}"
+
+    info = _REGISTRY[name]
+
+    # Check CLI commands, honouring the wrapper's explicit binary pin.
+    def _cli_missing(command: str) -> bool:
+        if command == "bibtex-check":
+            from hallmark.baselines.bibtexupdater import resolve_bibtex_check_bin
+
+            return resolve_bibtex_check_bin() is None
+        return shutil.which(command) is None
+
+    missing_cmds = [cmd for cmd in info.cli_commands if _cli_missing(cmd)]
+    if missing_cmds:
+        return (
+            False,
+            f"Missing CLI commands: {', '.join(missing_cmds)}. "
+            f"Install the package that provides them.",
+        )
+
+    # Check importable Python packages
+    missing_pkgs = []
+    for pkg in info.pip_packages:
+        module_name = _PIP_TO_MODULE.get(pkg, pkg.replace("-", "_"))
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            missing_pkgs.append(pkg)
+
+    if missing_pkgs:
+        return (
+            False,
+            f"Missing packages: {', '.join(missing_pkgs)}. "
+            f"Install with: pip install {' '.join(missing_pkgs)}",
+        )
+
+    # Check required environment variable for API-key baselines
+    if info.env_var:
+        import os
+
+        if info.env_var not in os.environ:
+            return (
+                False,
+                f"Missing environment variable: {info.env_var}. "
+                f"Set it with: export {info.env_var}=<your-key>",
+            )
+
+    return True, "OK"
+
+
+def run_baseline(
+    name: str,
+    entries: list[BenchmarkEntry],
+    split: str | None = None,
+    **kwargs: Any,
+) -> list[Prediction]:
+    """Run a baseline by name.
+
+    Converts BenchmarkEntry objects to BlindEntry before passing to the runner,
+    so baseline implementations never see ground-truth labels.
+
+    Args:
+        name: Registered baseline name.
+        entries: Benchmark entries to evaluate (ground-truth labels are hidden).
+        split: Name of the split being evaluated. Used to detect self-referential
+            evaluation (e.g., title_oracle on dev_public).
+        **kwargs: Extra arguments forwarded to the runner.
+
+    Returns:
+        List of predictions.
+
+    Raises:
+        ValueError: If baseline is unknown.
+        ImportError: If required packages are missing.
+    """
+    predictions, _ = run_baseline_with_tool_run(name, entries, split=split, **kwargs)
+    return predictions
+
+
+def run_baseline_with_tool_run(
+    name: str,
+    entries: list[BenchmarkEntry],
+    split: str | None = None,
+    **kwargs: Any,
+) -> tuple[list[Prediction], BibtexCheckRun | None]:
+    """Run a baseline and report the bibtex-check run it made, if any.
+
+    A caller that persists the result needs to know whether this baseline
+    started bibtex-check and what condition that call observed. It gets both
+    from the run returned here, so provenance never has to be inferred from
+    state another baseline or another worker may have written.
+
+    Returns:
+        The predictions, and the bibtex-check run this dispatch made or None
+        when the baseline never invoked the tool.
+    """
+    if name not in _REGISTRY:
+        raise ValueError(f"Unknown baseline: {name}. Available: {', '.join(_REGISTRY.keys())}")
+
+    info = _REGISTRY[name]
+    workers = kwargs.get("workers", 1)
+    if isinstance(workers, int) and workers > 1 and requires_single_worker(name, info):
+        raise ValueError(f"workers > 1 is not supported for CLI baseline {name!r}")
+
+    available, msg = check_available(name)
+    if not available:
+        raise ImportError(msg)
+
+    merged_kwargs = {**info.runner_kwargs, **kwargs}
+    if split is not None:
+        merged_kwargs.setdefault("split", split)
+
+    # Auto-inject the per-baseline API key from its declared env var so the
+    # openai SDK doesn't fall back to OPENAI_API_KEY for OpenRouter endpoints
+    # (which would silently 401). Only applied when the runner wasn't already
+    # given an explicit api_key, and only for API-key-gated baselines.
+    if info.requires_api_key and info.env_var and "api_key" not in merged_kwargs:
+        import os
+
+        env_key = os.environ.get(info.env_var)
+        if env_key:
+            merged_kwargs["api_key"] = env_key
+
+    from hallmark.baselines import bibtexupdater
+
+    # Clear the wrapper's record before dispatching, so what it holds
+    # afterwards describes this baseline's run and not the previous one's.
+    bibtexupdater.reset_run_state()
+
+    blind_entries = _to_blind(entries)
+    predictions = list(info.runner(blind_entries, **merged_kwargs))
+    return predictions, bibtexupdater.current_bibtex_check_run()
+
+
+# Mapping from pip package names to importable module names
+_PIP_TO_MODULE: dict[str, str] = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+}
+
+
+# ---------------------------------------------------------------------------
+# Register all built-in baselines
+# ---------------------------------------------------------------------------
+
+
+def _register_builtins() -> None:
+    """Register all built-in baselines on module import."""
+
+    # --- DOI-presence heuristic (no extra deps) ---
+    def _run_doi_presence_heuristic(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.doi_presence import run_doi_presence_heuristic
+
+        return run_doi_presence_heuristic(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="doi_presence_heuristic",
+            description="Trivial heuristic: predict HALLUCINATED when DOI is absent",
+            runner=_run_doi_presence_heuristic,
+            confidence_type="binary",
+        )
+    )
+
+    # --- DOI-only (no extra deps) ---
+    def _run_doi_only(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.doi_only import run_doi_only
+
+        return run_doi_only(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="doi_only",
+            description="Simple DOI resolution check via doi.org",
+            runner=_run_doi_only,
+            confidence_type="binary",
+        )
+    )
+
+    # --- DOI-only (no pre-screening) ---
+    def _run_doi_only_no_prescreening(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.doi_only import run_doi_only
+
+        return run_doi_only(entries, skip_prescreening=True, **kw)
+
+    register(
+        BaselineInfo(
+            name="doi_only_no_prescreening",
+            description="DOI resolution check without pre-screening layer (ablation baseline)",
+            runner=_run_doi_only_no_prescreening,
+            confidence_type="binary",
+        )
+    )
+
+    # --- bibtex-updater ---
+    def _run_bibtexupdater(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.bibtexupdater import run_bibtex_check
+
+        return run_bibtex_check(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="bibtexupdater",
+            description="bibtex-check CLI: CrossRef, DBLP, Semantic Scholar",
+            runner=_run_bibtexupdater,
+            cli_commands=["bibtex-check"],
+            confidence_type="heuristic",
+        )
+    )
+
+    # --- bibtex-updater (no pre-screening) ---
+    def _run_bibtexupdater_no_prescreening(
+        entries: list[BlindEntry], **kw: Any
+    ) -> list[Prediction]:
+        from hallmark.baselines.bibtexupdater import run_bibtex_check
+
+        return run_bibtex_check(entries, skip_prescreening=True, **kw)
+
+    register(
+        BaselineInfo(
+            name="bibtexupdater_no_prescreening",
+            description="bibtex-check CLI without pre-screening layer (ablation baseline)",
+            runner=_run_bibtexupdater_no_prescreening,
+            cli_commands=["bibtex-check"],
+            confidence_type="heuristic",
+        )
+    )
+
+    # --- HaRC ---
+    def _run_harc(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.harc import run_harc
+
+        return run_harc(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="harc",
+            description="HaRC: Semantic Scholar, DBLP, Google Scholar, Open Library",
+            runner=_run_harc,
+            cli_commands=["harcx"],
+            confidence_type="heuristic",
+        )
+    )
+
+    # --- HaRC (no pre-screening) ---
+    def _run_harc_no_prescreening(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.harc import run_harc
+
+        return run_harc(entries, skip_prescreening=True, **kw)
+
+    register(
+        BaselineInfo(
+            name="harc_no_prescreening",
+            description="HaRC without pre-screening layer (ablation baseline)",
+            runner=_run_harc_no_prescreening,
+            cli_commands=["harcx"],
+            confidence_type="heuristic",
+        )
+    )
+
+    # --- verify-citations ---
+    def _run_verify_citations(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.verify_citations_baseline import run_verify_citations
+
+        return run_verify_citations(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="verify_citations",
+            description="verify-citations: arXiv, ACL, S2, DBLP, Google Scholar, DuckDuckGo",
+            runner=_run_verify_citations,
+            cli_commands=["verify-citations"],
+            confidence_type="heuristic",
+        )
+    )
+
+    # --- verify-citations (no pre-screening) ---
+    def _run_verify_citations_no_prescreening(
+        entries: list[BlindEntry], **kw: Any
+    ) -> list[Prediction]:
+        from hallmark.baselines.verify_citations_baseline import run_verify_citations
+
+        return run_verify_citations(entries, skip_prescreening=True, **kw)
+
+    register(
+        BaselineInfo(
+            name="verify_citations_no_prescreening",
+            description="verify-citations without pre-screening layer (ablation baseline)",
+            runner=_run_verify_citations_no_prescreening,
+            cli_commands=["verify-citations"],
+            confidence_type="heuristic",
+        )
+    )
+
+    # --- LLM: OpenAI ---
+    def _run_llm_openai(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_verifier import verify_with_openai
+
+        return verify_with_openai(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_openai",
+            description="GPT-5.1 citation verification via OpenAI API",
+            runner=_run_llm_openai,
+            pip_packages=["openai"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="OPENAI_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # GPT-5.5 native baseline (released 2026-04-24; non-reasoning chat model).
+    def _run_llm_openai_gpt55(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_verifier import verify_with_openai
+
+        return verify_with_openai(entries, model="gpt-5.5", **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_openai_gpt55",
+            description="GPT-5.5 citation verification via OpenAI API (released 2026-04-24)",
+            runner=_run_llm_openai_gpt55,
+            pip_packages=["openai"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="OPENAI_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # --- LLM: Anthropic ---
+    def _run_llm_anthropic(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_verifier import verify_with_anthropic
+
+        return verify_with_anthropic(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_anthropic",
+            description=(
+                "Claude Sonnet 4.6 citation verification via Anthropic API"
+                " (default; override via model= kwarg)"
+            ),
+            runner=_run_llm_anthropic,
+            pip_packages=["anthropic"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="ANTHROPIC_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # Claude Opus 4.7 native baseline (released 2026-04-16; $5/$25 per M tok).
+    def _run_llm_anthropic_opus_4_7(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_verifier import verify_with_anthropic
+
+        return verify_with_anthropic(entries, model="claude-opus-4-7", **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_anthropic_opus_4_7",
+            description=(
+                "Claude Opus 4.7 citation verification via Anthropic API (released 2026-04-16)"
+            ),
+            runner=_run_llm_anthropic_opus_4_7,
+            pip_packages=["anthropic"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="ANTHROPIC_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # --- LLM: OpenRouter (per-model baselines) ---
+    from hallmark.baselines.llm_verifier import OPENROUTER_MODELS
+
+    for friendly_name, model_id in OPENROUTER_MODELS.items():
+        baseline_name = f"llm_openrouter_{friendly_name.replace('-', '_')}"
+
+        def _make_openrouter_runner(
+            mid: str,
+        ) -> Callable[..., list[Prediction]]:
+            def _run(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+                from hallmark.baselines.llm_verifier import verify_with_openrouter
+
+                return verify_with_openrouter(entries, model=mid, **kw)
+
+            return _run
+
+        register(
+            BaselineInfo(
+                name=baseline_name,
+                description=f"OpenRouter citation verification ({model_id})",
+                runner=_make_openrouter_runner(model_id),
+                pip_packages=["openai"],
+                requires_api_key=True,
+                is_free=False,
+                env_var="OPENROUTER_API_KEY",
+                confidence_type="probabilistic",
+            )
+        )
+
+    # --- LLM: HuggingFace router (Qwen3 dense parameter-count sweep) ---
+    from hallmark.baselines.llm_verifier import HF_MODELS
+
+    for friendly_name, model_id in HF_MODELS.items():
+        baseline_name = f"llm_hf_{friendly_name.replace('-', '_')}"
+
+        def _make_hf_runner(mid: str) -> Callable[..., list[Prediction]]:
+            def _run(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+                from hallmark.baselines.llm_verifier import verify_with_huggingface
+
+                return verify_with_huggingface(entries, model=mid, **kw)
+
+            return _run
+
+        register(
+            BaselineInfo(
+                name=baseline_name,
+                description=f"HuggingFace router citation verification ({model_id})",
+                runner=_make_hf_runner(model_id),
+                pip_packages=["openai"],
+                requires_api_key=True,
+                is_free=False,
+                env_var="HF_TOKEN",
+                confidence_type="probabilistic",
+            )
+        )
+
+    # --- LLM: Cutoff-aware prompt ablation ---------------------------------
+    # These variants append the CUTOFF_AWARE_ADDENDUM to the default prompt,
+    # explicitly telling the model to route post-cutoff citations to UNCERTAIN
+    # rather than over-flag them as HALLUCINATED.  They test H2 from the
+    # temporal-analysis appendix ("if told about the cutoff, do LLMs actually
+    # route post-cutoff citations to UNCERTAIN?") as a separate hypothesis
+    # from H1 ("LLMs do not know their own cutoff").  DeepSeek variants are
+    # intentionally omitted because they already saturate at UNCERTAIN in the
+    # default prompt (see DeepSeek-R1 note in the temporal-analysis appendix).
+    def _run_llm_openai_cutoff_aware(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_verifier import verify_with_openai
+
+        return verify_with_openai(entries, cutoff_aware=True, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_openai_cutoff_aware",
+            description=(
+                "GPT-5.1 with cutoff-aware prompt addendum (explicitly allows UNCERTAIN "
+                "for post-cutoff citations) — ablation for temporal robustness analysis"
+            ),
+            runner=_run_llm_openai_cutoff_aware,
+            pip_packages=["openai"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="OPENAI_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    def _run_llm_anthropic_cutoff_aware(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_verifier import verify_with_anthropic
+
+        return verify_with_anthropic(entries, cutoff_aware=True, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_anthropic_cutoff_aware",
+            description=(
+                "Claude Sonnet 4.6 with cutoff-aware prompt addendum — ablation for "
+                "temporal robustness analysis (default; override via model= kwarg)"
+            ),
+            runner=_run_llm_anthropic_cutoff_aware,
+            pip_packages=["anthropic"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="ANTHROPIC_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # Cutoff-aware OpenRouter variants — only the subset of models used in the
+    # temporal paper subsection (Gemini 2.5 Flash, Qwen3-235B).  Mistral is
+    # also omitted because it behaves similarly to Qwen.
+    _CUTOFF_AWARE_OPENROUTER = {
+        "gemini-flash": OPENROUTER_MODELS["gemini-flash"],
+        "qwen": OPENROUTER_MODELS["qwen"],
+    }
+    for friendly_name, model_id in _CUTOFF_AWARE_OPENROUTER.items():
+        baseline_name = f"llm_openrouter_{friendly_name.replace('-', '_')}_cutoff_aware"
+
+        def _make_openrouter_cutoff_aware_runner(
+            mid: str,
+        ) -> Callable[..., list[Prediction]]:
+            def _run(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+                from hallmark.baselines.llm_verifier import verify_with_openrouter
+
+                return verify_with_openrouter(entries, model=mid, cutoff_aware=True, **kw)
+
+            return _run
+
+        register(
+            BaselineInfo(
+                name=baseline_name,
+                description=(
+                    f"OpenRouter ({model_id}) with cutoff-aware prompt addendum — "
+                    "ablation for temporal robustness analysis"
+                ),
+                runner=_make_openrouter_cutoff_aware_runner(model_id),
+                pip_packages=["openai"],
+                requires_api_key=True,
+                is_free=False,
+                env_var="OPENROUTER_API_KEY",
+                confidence_type="probabilistic",
+            )
+        )
+
+    # --- LLM: Tool-augmented (GPT-5.1 + bibtex-updater) ---
+    def _run_llm_tool_augmented(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_tool_augmented import verify_tool_augmented
+
+        return verify_tool_augmented(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_tool_augmented",
+            description="GPT-5.1 augmented with bibtex-updater verification evidence",
+            runner=_run_llm_tool_augmented,
+            pip_packages=["openai"],
+            cli_commands=["bibtex-check"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="OPENAI_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # --- LLM: Agentic OpenAI ---
+    def _run_llm_agentic_openai(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_agentic import verify_agentic_openai
+
+        return verify_agentic_openai(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_agentic_openai",
+            description=(
+                "GPT-5.1 with tool-use: resolve_doi, search_crossref, "
+                "search_openalex, search_arxiv (up to 5 tool calls per entry)"
+            ),
+            runner=_run_llm_agentic_openai,
+            pip_packages=["openai"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="OPENAI_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # --- LLM: Agentic OpenAI GPT-5.4 ---
+    # Model-pinned variant of llm_agentic_openai: same native endpoint, same tools,
+    # only the model id differs. Pinned to the bare "gpt-5.4" alias to match every
+    # prior GPT-5.4 experiment (scripts/run_gpt54_splits.py). Needed because
+    # `hallmark evaluate` has no --model flag, so a cascade Stage 2 diagnoser can
+    # only be pinned through the registry.
+    def _run_llm_agentic_openai_gpt_5_4(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_agentic import verify_agentic_openai
+
+        kw.setdefault("model", "gpt-5.4")
+        return verify_agentic_openai(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_agentic_openai_gpt_5_4",
+            description=(
+                "GPT-5.4 with tool-use: resolve_doi, search_crossref, "
+                "search_openalex, search_arxiv (up to 5 tool calls per entry). "
+                "Native OpenAI endpoint; GPT-5.4 counterpart of llm_agentic_openai."
+            ),
+            runner=_run_llm_agentic_openai_gpt_5_4,
+            pip_packages=["openai"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="OPENAI_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # --- LLM: Agentic Anthropic ---
+    def _run_llm_agentic_anthropic(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_agentic import verify_agentic_anthropic
+
+        return verify_agentic_anthropic(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_agentic_anthropic",
+            description=(
+                "Claude Sonnet 4.6 with tool-use: resolve_doi, search_crossref, "
+                "search_openalex, search_arxiv (up to 5 tool calls per entry). "
+                "Native Anthropic SDK; for the OpenRouter-routed path used in "
+                "the paper, see scripts/parallel_agentic_btu_test_public.py."
+            ),
+            runner=_run_llm_agentic_anthropic,
+            pip_packages=["anthropic"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="ANTHROPIC_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # --- LLM: Agentic OpenRouter Claude Sonnet 4.6 ---
+    # Routes the OpenAI-compatible agentic harness through OpenRouter to use
+    # anthropic/claude-sonnet-4.6 without requiring an Anthropic API key.
+    # Drop-in replacement for llm_agentic_anthropic; used as the Stage 2
+    # diagnoser for the cascade_db_diagnosis baselines in the paper.
+    def _run_llm_agentic_openrouter_claude_sonnet_4_6(
+        entries: list[BlindEntry], **kw: Any
+    ) -> list[Prediction]:
+        from hallmark.baselines.llm_agentic import verify_agentic_openai
+
+        kw.setdefault("model", "anthropic/claude-sonnet-4.6")
+        kw.setdefault("base_url", "https://openrouter.ai/api/v1")
+        kw.setdefault("api_key", os.environ.get("OPENROUTER_API_KEY"))
+        return verify_agentic_openai(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_agentic_openrouter_claude_sonnet_4_6",
+            description=(
+                "Agentic Sonnet 4.6 via OpenRouter (anthropic/claude-sonnet-4.6) "
+                "using the OpenAI-compatible SDK. Drop-in for llm_agentic_anthropic "
+                "without an Anthropic API key; used as the Stage 2 diagnoser for "
+                "cascade_db_diagnosis baselines in the paper."
+            ),
+            runner=_run_llm_agentic_openrouter_claude_sonnet_4_6,
+            pip_packages=["openai"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="OPENROUTER_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # NOTE: ``llm_agentic_openrouter_gpt_5_1`` was removed once a native OpenAI key
+    # became available. It routed GPT-5.1 through OpenRouter as ``openai/gpt-5.1``,
+    # which made its runs inconsistent with every other GPT-5.1 experiment (all of
+    # which used the native endpoint and the bare ``gpt-5.1`` model id). Use
+    # ``llm_agentic_openai`` for GPT-5.1 Stage 2 diagnosis.
+
+    # --- LLM: Agentic BTU-only (OpenAI) ---
+    def _run_llm_agentic_btu_openai(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_agentic import verify_agentic_btu_openai
+
+        return verify_agentic_btu_openai(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_agentic_btu_openai",
+            description=(
+                "GPT-5.1 agentic harness with bibtex-updater exposed as its only "
+                "tool — tests whether the LLM is a useful dispatcher for BTU"
+            ),
+            runner=_run_llm_agentic_btu_openai,
+            pip_packages=["openai"],
+            cli_commands=["bibtex-check"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="OPENAI_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # --- LLM: Agentic BTU-only (Anthropic) ---
+    def _run_llm_agentic_btu_anthropic(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.llm_agentic import verify_agentic_btu_anthropic
+
+        return verify_agentic_btu_anthropic(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="llm_agentic_btu_anthropic",
+            description=(
+                "Claude Sonnet 4.6 agentic harness with bibtex-updater as only "
+                "tool (native Anthropic SDK; OpenRouter-routed equivalent used "
+                "in the paper)."
+            ),
+            runner=_run_llm_agentic_btu_anthropic,
+            pip_packages=["anthropic"],
+            cli_commands=["bibtex-check"],
+            requires_api_key=True,
+            is_free=False,
+            env_var="ANTHROPIC_API_KEY",
+            confidence_type="probabilistic",
+        )
+    )
+
+    # --- Title-match oracle (diagnostic baseline) ---
+    # NOTE: This is NOT a legitimate detector.  It exploits label leakage by
+    # looking up dev-split VALID titles.  Register it here so it appears in
+    # the registry for transparency and paper reporting purposes.
+    def _run_title_oracle(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.title_oracle import run_title_oracle
+        from hallmark.dataset.loader import load_split
+
+        split = kw.pop("split", None)
+        if split == "dev_public":
+            logger.warning(
+                "Title oracle is self-referential when evaluated on dev_public. "
+                "Results reflect label memorization, not detection capability."
+            )
+
+        reference_pool = load_split("dev_public")
+
+        # Warn if input entries overlap significantly with the reference pool
+        # (catches self-referential evaluation even without explicit split name)
+        if split is None:
+            input_keys = {e.bibtex_key for e in entries}
+            ref_keys = {e.bibtex_key for e in reference_pool}
+            overlap = input_keys & ref_keys
+            if len(input_keys) > 0 and len(overlap) / len(input_keys) > 0.5:
+                logger.warning(
+                    "Title oracle: >50%% of input entries overlap with the dev_public reference "
+                    "pool (%d/%d). Results reflect label memorization, not detection capability.",
+                    len(overlap),
+                    len(input_keys),
+                )
+
+        return run_title_oracle(entries, reference_pool, **kw)
+
+    register(
+        BaselineInfo(
+            name="title_oracle",
+            description=(
+                "Title-match oracle (diagnostic — exploits perturbation structure). "
+                "NOT a legitimate detector: uses dev VALID titles as a label look-up table."
+            ),
+            runner=_run_title_oracle,
+            confidence_type="binary",
+            # is_free=True (no API key, no extra packages)
+        )
+    )
+
+    # --- Degenerate baselines (statistical reference points) ---
+    def _run_random(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.degenerate import random_baseline
+
+        kw.pop("split", None)  # dispatch-level; the baseline does not use it
+        return random_baseline(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="random",
+            description="Random baseline: predict HALLUCINATED with probability=prevalence (default 0.5)",
+            runner=_run_random,
+            confidence_type="binary",
+        )
+    )
+
+    def _run_always_hallucinated(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.degenerate import always_hallucinated_baseline
+
+        return always_hallucinated_baseline(entries)
+
+    register(
+        BaselineInfo(
+            name="always_hallucinated",
+            description="Constant baseline: predict HALLUCINATED for every entry",
+            runner=_run_always_hallucinated,
+            confidence_type="binary",
+        )
+    )
+
+    def _run_always_valid(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.degenerate import always_valid_baseline
+
+        return always_valid_baseline(entries)
+
+    register(
+        BaselineInfo(
+            name="always_valid",
+            description="Constant baseline: predict VALID for every entry",
+            runner=_run_always_valid,
+            confidence_type="binary",
+        )
+    )
+
+    # --- Venue oracle (diagnostic baseline) ---
+    def _run_venue_oracle(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.degenerate import venue_oracle_baseline
+
+        kw.pop("split", None)  # dispatch-level; the baseline does not use it
+        return venue_oracle_baseline(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="venue_oracle",
+            description=(
+                "Venue-oracle (diagnostic — exploits venue distribution bias). "
+                "NOT a legitimate detector: flags entries whose venue is absent from VALID data."
+            ),
+            runner=_run_venue_oracle,
+            confidence_type="binary",
+        )
+    )
+
+    # --- Ensemble ---
+    def _run_ensemble(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.bibtexupdater import SourceOutageError
+        from hallmark.baselines.ensemble import ensemble_predict
+
+        # Default: combine doi_only + bibtexupdater
+        # Entries are already BlindEntry here, so call component runners directly
+        # (bypassing run_baseline which would attempt a second to_blind() conversion).
+        strategy_preds: dict[str, list[Prediction]] = {}
+        for dep_name in ["doi_only", "bibtexupdater"]:
+            avail, _ = check_available(dep_name)
+            if avail:
+                try:
+                    dep_info = _REGISTRY[dep_name]
+                    dep_kwargs = dict(dep_info.runner_kwargs)
+                    strategy_preds[dep_name] = dep_info.runner(entries, **dep_kwargs)
+                except SourceOutageError:
+                    # The component disowned its run. Dropping it here would
+                    # score doi_only alone under the ensemble's name -- which
+                    # is what happened with DBLP down on 2026-09-05.
+                    raise
+                except Exception as e:
+                    logger.warning(f"Ensemble: skipping {dep_name}: {e}")
+
+        if not strategy_preds:
+            logger.error("Ensemble: no component baselines available")
+            return fallback_predictions(entries, reason="Ensemble: no components")
+
+        kw.pop("split", None)  # dispatch-level; the ensemble does not use it
+        return ensemble_predict(entries, strategy_preds, **kw)
+
+    register(
+        BaselineInfo(
+            name="ensemble",
+            description="Weighted vote across available free baselines",
+            runner=_run_ensemble,
+            confidence_type="heuristic",
+        )
+    )
+
+    # --- HalluCiteChecker (port of Sakai et al., 2026) ---
+    def _run_hallucitechecker(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.hallucitechecker import run_hallucitechecker
+
+        return run_hallucitechecker(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="hallucitechecker",
+            description=(
+                "Title-based fuzzy match against CrossRef/arXiv/Semantic Scholar "
+                "(port of Sakai et al., 2026 HalluCiteChecker; uses APIs instead "
+                "of local snapshots)."
+            ),
+            runner=_run_hallucitechecker,
+            confidence_type="heuristic",
+        )
+    )
+
+    # --- CheckIfExist (port of Abbonato 2026, Algorithm 1) ---
+    def _run_checkifexist(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.checkifexist import run_checkifexist
+
+        return run_checkifexist(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="checkifexist",
+            description=(
+                "Cascading 3-source verification with cross-source author "
+                "intersection (port of Abbonato 2026 Algorithm 1)."
+            ),
+            runner=_run_checkifexist,
+            confidence_type="heuristic",
+        )
+    )
+
+    # --- DB-first cascade with hallucination-mode diagnosis ---
+    def _run_cascade(entries: list[BlindEntry], **kw: Any) -> list[Prediction]:
+        from hallmark.baselines.cascade import run_cascade
+
+        return run_cascade(entries, **kw)
+
+    register(
+        BaselineInfo(
+            name="cascade_db_diagnosis",
+            description=(
+                "DB-first cascade: bibtexupdater Stage 1 + LLM diagnoser Stage 2. "
+                "Conservative mode — UNCERTAIN entries pass through unchanged."
+            ),
+            runner=_run_cascade,
+            cli_commands=["bibtex-check"],
+            requires_api_key=True,
+            env_var="ANTHROPIC_API_KEY",
+            confidence_type="heuristic",
+            runner_kwargs={
+                "stage2_baseline": "llm_agentic_anthropic",
+                "aggressive": False,
+            },
+        )
+    )
+
+    register(
+        BaselineInfo(
+            name="cascade_db_diagnosis_aggressive",
+            description=(
+                "DB-first cascade (aggressive). Treats database lookups as gold "
+                "standard: any entry not affirmatively verified by Stage 1 or "
+                "Stage 2 is flagged HALLUCINATED. Pair with --eval-mode both to "
+                "quantify the DB-indexing-lag tax."
+            ),
+            runner=_run_cascade,
+            cli_commands=["bibtex-check"],
+            requires_api_key=True,
+            env_var="ANTHROPIC_API_KEY",
+            confidence_type="heuristic",
+            runner_kwargs={
+                "stage2_baseline": "llm_agentic_anthropic",
+                "aggressive": True,
+            },
+        )
+    )
+
+
+_register_builtins()

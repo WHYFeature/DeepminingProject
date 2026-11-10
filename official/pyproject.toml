@@ -1,0 +1,131 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hallmark"
+dynamic = ["version"]
+description = "A benchmark for evaluating citation hallucination detection tools"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Patrik Reizinger", email = "patrik.reizinger@gmail.com" },
+]
+keywords = ["benchmark", "citations", "hallucination", "bibtex", "verification"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Text Processing :: Markup :: LaTeX",
+]
+dependencies = [
+    "bibtexparser>=2.0.0b",
+    "requests>=2.28",
+    "httpx>=0.24",
+    "rapidfuzz>=3.0",
+]
+
+[project.optional-dependencies]
+baselines = [
+    "openai>=1.0",
+    "anthropic>=0.79.0",
+]
+ranking = [
+    "choix>=0.3",
+    "numpy>=1.24",
+]
+scraping = [
+    "beautifulsoup4>=4.12",
+    "lxml>=4.9",
+]
+analysis = [
+    "scikit-learn>=1.0",
+]
+# scripts/generate_figures.py, the generator of record for the paper figures.
+figures = [
+    "matplotlib>=3.7",
+    "numpy>=1.24",
+]
+# Optional infrastructure for reproducible HALLMARK eval runs:
+# requests-cache wraps HTTP calls in a SQLite-backed cache so re-runs
+# reuse frozen API responses (see hallmark/baselines/_http_cache.py and
+# the --cache-path CLI flag).
+reproducibility = [
+    "requests-cache>=1.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+    "mypy>=1.0",
+    "numpy>=1.24",
+]
+all = ["hallmark[baselines,ranking,scraping,analysis,figures,dev]"]
+# NOTE: bibtex-updater and harcx require bibtexparser 1.x which conflicts
+# with hallmark's bibtexparser>=2.0. Install them in isolation:
+#   pipx install "bibtex-updater>=1.11.0"  # wrapper target; released dev/test numbers
+#                                          # used 1.2.0, the W&W supplement 1.4.0 (README)
+#   pipx install harcx
+
+[project.scripts]
+hallmark = "hallmark.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/rpatrik96/hallmark"
+Documentation = "https://github.com/rpatrik96/hallmark#readme"
+Repository = "https://github.com/rpatrik96/hallmark.git"
+Issues = "https://github.com/rpatrik96/hallmark/issues"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+version_scheme = "no-guess-dev"
+
+[tool.hatch.build.targets.sdist]
+exclude = ["paper/"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["hallmark"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.ruff.lint.isort]
+known-first-party = ["hallmark"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["choix"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["hallmark"]
+omit = ["hallmark/baselines/llm_verifier.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

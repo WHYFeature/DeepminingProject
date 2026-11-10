@@ -1,0 +1,1053 @@
+"""Pure tool wrappers for the agentic citation-verification baseline.
+
+Each function makes one external API call, normalises the result to a flat
+dict ``{authors, title, venue, year, doi}`` (fields truncated to 500 chars),
+and raises on error so the caller can apply retry/backoff.
+
+Tool set mirrors bibtex-updater's lookup sources:
+- resolve_doi      — CrossRef DOI resolution (reuses prescreening DOI helper)
+- search_crossref  — CrossRef title/author search
+- search_openalex  — OpenAlex polite pool
+- search_arxiv     — arXiv API
+
+Every outbound request passes through a process-wide, per-service rate limiter
+first (see "Per-service pacing" below), because the sources publish their limits
+per caller while Stage 2 calls them from several worker threads at once.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import email.utils
+import logging
+import math
+import os
+import re
+import threading
+import time
+import urllib.parse
+import urllib.request
+from collections.abc import Iterator
+from typing import Any
+
+from hallmark.baselines._cache import RateLimitedError
+
+logger = logging.getLogger(__name__)
+
+_MAX_FIELD_CHARS = 500
+_OPENALEX_MAILTO = "hallmark@example.com"
+
+# ``export.arxiv.org`` is markedly slower than the other metadata sources and is the
+# only one that produced read timeouts in the 2026-07 cascade run (~29 lookups lost at
+# a 15s ceiling, each after three retries). Give it a longer allowance than the rest.
+_ARXIV_TIMEOUT_SECONDS = 30.0
+
+# Status codes that mean "you are being throttled, come back later" rather than
+# "this request was wrong". Both may carry a ``Retry-After`` header.
+_THROTTLE_STATUS_CODES = frozenset({429, 503})
+
+# OpenAlex answers 429 for two unrelated reasons and distinguishes them only by the
+# size of ``Retry-After``: a burst throttle asks for 1-60s, while an exhausted daily
+# quota asks for the seconds remaining until midnight UTC. The 2026-08-04 GPT-5.4 dev
+# run observed exactly that split — 1-60s bursts, then 27087-52660s caps with nothing
+# in between — so any threshold inside that gap separates them cleanly. Retrying
+# through a cap is futile (that run burned ~7h and lost 239 of 262 lookups doing so);
+# the right move is to fail over to the next credential.
+_OPENALEX_CAP_RETRY_AFTER_SECONDS = 3600.0
+
+# Sentinel for the keyless mailto pool inside ``_openalex_exhausted``, which stores
+# plain key strings for everything else.
+_OPENALEX_POLITE_POOL = ""
+
+# A metered key answers "you are out of credit" with a payment/authorisation status
+# rather than a throttle, and those carry no ``Retry-After`` to read a deadline from.
+_OPENALEX_CREDIT_STATUS_CODES = frozenset({402, 403})
+
+# Credentials retired until their quota is expected back, as monotonic deadlines.
+# Guarded by a lock: the cascade runs Stage 2 across worker threads sharing this module.
+_openalex_exhausted: dict[str, float] = {}
+_openalex_key_lock = threading.Lock()
+
+
+def _seconds_until_utc_midnight() -> float:
+    """Return seconds from now until the next 00:00 UTC.
+
+    OpenAlex resets daily quota at midnight UTC — every capped ``Retry-After`` in the
+    2026-08-04 run pointed there. Used as the fallback deadline for the credit-exhaustion
+    statuses, which state no deadline of their own.
+    """
+    now = dt.datetime.now(dt.timezone.utc)
+    tomorrow = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (tomorrow - now).total_seconds()
+
+
+def _openalex_keys() -> list[str]:
+    """Return the configured OpenAlex API keys, in preference order.
+
+    ``OPENALEX_API_KEY`` holds one key, or several separated by commas so a run can
+    fail over when the first is spent.
+    """
+    raw = os.environ.get("OPENALEX_API_KEY", "")
+    return [key for part in raw.split(",") if (key := part.strip())]
+
+
+def _openalex_key_candidates() -> Iterator[str | None]:
+    """Yield the keyless mailto pool first, then each key whose quota is believed back.
+
+    Keyless comes first on purpose: the mailto pool is free and generous (100k/day),
+    while an API key draws on a metered daily allowance. Spending the free pool before
+    touching the key keeps the paid budget for when it is the only thing left.
+
+    Retirements expire. A credential whose deadline has passed is pruned here and
+    rejoins the order — which for the polite pool means it returns to the *front*, so a
+    run that outlives a midnight reset stops spending the key without being told to.
+    """
+    now = time.monotonic()
+    with _openalex_key_lock:
+        for slot, until in list(_openalex_exhausted.items()):
+            if until <= now:
+                del _openalex_exhausted[slot]
+        exhausted = set(_openalex_exhausted)
+    if _OPENALEX_POLITE_POOL not in exhausted:
+        yield None
+    for key in _openalex_keys():
+        if key not in exhausted:
+            yield key
+
+
+def _retire_openalex_key(key: str | None, retry_after: float | None, status_code: int) -> bool:
+    """Retire a credential whose quota is gone, until it is expected back.
+
+    Distinguishes the three ways a request can come back unhappy:
+
+    - 429 with a long ``Retry-After`` — daily quota spent; retire until it lifts.
+    - 402/403 — a metered key out of credit; no deadline given, so assume the same
+      midnight-UTC reset the throttled responses use.
+    - anything else, including 503 — not a quota problem. A burst throttle is the
+      backoff layer's job, and a server outage hits every credential equally, so
+      failing over would only repeat the request against the same dead host.
+
+    Args:
+        key: The credential that failed, or ``None`` for the keyless mailto pool.
+        retry_after: Seconds the server asked us to wait, when it said.
+        status_code: HTTP status of the failed response.
+
+    Returns:
+        ``True`` when the credential was retired and the caller should try the next
+        one; ``False`` when this failure is not a reason to fail over.
+    """
+    if status_code in _OPENALEX_CREDIT_STATUS_CODES:
+        wait = _seconds_until_utc_midnight()
+        reason = f"HTTP {status_code}"
+    elif status_code == 429 and retry_after is not None:
+        if retry_after <= _OPENALEX_CAP_RETRY_AFTER_SECONDS:
+            return False
+        wait = retry_after
+        reason = f"asked for {retry_after:.0f}s"
+    else:
+        return False
+
+    slot = _OPENALEX_POLITE_POOL if key is None else key
+    deadline = time.monotonic() + wait
+    with _openalex_key_lock:
+        newly_retired = slot not in _openalex_exhausted
+        _openalex_exhausted[slot] = deadline
+    if newly_retired:
+        label = "keyless mailto pool" if key is None else f"key ...{key[-4:]}"
+        logger.warning(
+            "OpenAlex %s is out of quota (%s); failing over for %.0fs",
+            label,
+            reason,
+            wait,
+        )
+    return True
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a ``Retry-After`` header into a number of seconds.
+
+    RFC 9110 permits two forms: delta-seconds (``"30"``) or an HTTP-date
+    (``"Wed, 21 Oct 2026 07:28:00 GMT"``). Both are accepted.
+
+    Args:
+        value: Raw header value, or ``None`` when the server omitted it.
+
+    Returns:
+        Seconds to wait, or ``None`` if absent, unparseable, or already elapsed.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    import datetime as _dt
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=_dt.timezone.utc)
+    delta = (when - now).total_seconds()
+    return max(0.0, delta) if delta > 0 else None
+
+
+def _raise_for_throttle(resp: Any, source: str) -> None:
+    """Raise :class:`RateLimitedError` carrying ``Retry-After`` if *resp* is throttled.
+
+    Args:
+        resp: The HTTP response to inspect.
+        source: Human-readable source name used in the error message.
+    """
+    if resp is None or resp.status_code not in _THROTTLE_STATUS_CODES:
+        return
+    retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+    if retry_after is not None:
+        logger.debug("%s asked us to retry after %.1fs", source, retry_after)
+    raise RateLimitedError(f"{source} returned HTTP {resp.status_code}", retry_after=retry_after)
+
+
+def _trunc(value: object) -> str:
+    """Convert value to str and truncate to _MAX_FIELD_CHARS."""
+    s = str(value) if value is not None else ""
+    return s[:_MAX_FIELD_CHARS]
+
+
+def _normalise(raw: dict) -> dict[str, str]:
+    """Flatten an arbitrary API response to a canonical 5-field dict."""
+    return {
+        "authors": _trunc(raw.get("authors", "")),
+        "title": _trunc(raw.get("title", "")),
+        "venue": _trunc(raw.get("venue", "")),
+        "year": _trunc(raw.get("year", "")),
+        "doi": _trunc(raw.get("doi", "")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-service pacing
+# ---------------------------------------------------------------------------
+
+# Source APIs publish their limits per *caller*, not per process and not per thread, so
+# retry-on-429 is not pacing. Stage 2 runs 6-8 worker threads that all reach the sources
+# through this module, and each is free to fire the moment its last request returned. A
+# 2026-09 Stage-2 run measured what that costs on the tightest source: arXiv answered 21
+# requests and rejected 356, answering for roughly the first minute and returning 429
+# from then on, while CrossRef (93 of 93) and OpenAlex (100 of 101) stayed clean in the
+# same run. Stage 1 escapes this because it goes through ``bibtex-check``, which paces
+# per service itself; Stage 2 never invokes that CLI and so inherited none of it.
+#
+# Budgets are requests per minute, shared by every thread in the process. arXiv's
+# published ceiling is ~20/min per caller; the others sit under their source's
+# documented allowance. ``dblp``, ``openreview`` and ``openlibrary`` have no caller in
+# this module yet — they are listed so a tool added later inherits pacing rather than
+# repeating the defect.
+_DEFAULT_SERVICE_RATES: dict[str, float] = {
+    "arxiv": 20.0,
+    "crossref": 300.0,
+    "openalex": 150.0,
+    "dblp": 30.0,
+    "semanticscholar": 10.0,
+    "openreview": 30.0,
+    "openlibrary": 30.0,
+    # ``bibtex-check`` is a subprocess with its own outbound calls, paced internally by
+    # its ``--rate-limit`` flag. What this budget caps is how often we start one.
+    "bibtexupdater": 60.0,
+}
+
+# ``HALLMARK_ARXIV_RATE=10`` halves arXiv's budget, which is what a run sharded across
+# two processes needs: the published limit belongs to the caller, so the processes have
+# to divide it between them. Mirrors bibtex-updater's ``BIBTEX_ARXIV_RATE``.
+_RATE_ENV_TEMPLATE = "HALLMARK_{service}_RATE"
+
+
+class _ServiceRateLimiter:
+    """Space requests to one service evenly across every thread in the process.
+
+    Admissions are handed out one interval apart rather than as a refillable burst. The
+    measured arXiv rejections began after a burst, so a bucket that let eight workers
+    through at once would reproduce them.
+    """
+
+    def __init__(self, rate_per_minute: float) -> None:
+        self._lock = threading.Lock()
+        self._next_free = 0.0
+        self.rate_per_minute = 0.0
+        self._interval = 0.0
+        self.set_rate(rate_per_minute)
+
+    def set_rate(self, rate_per_minute: float) -> None:
+        """Adopt a new budget, keeping the pacing state already accrued.
+
+        A non-positive rate means "unpaced", which is what an unknown service gets.
+        """
+        with self._lock:
+            self.rate_per_minute = rate_per_minute
+            self._interval = 60.0 / rate_per_minute if rate_per_minute > 0.0 else 0.0
+
+    def acquire(self) -> float:
+        """Block until the next request to this service may go out.
+
+        Returns:
+            Seconds spent waiting, for logging and for tests.
+        """
+        with self._lock:
+            if self._interval <= 0.0:
+                return 0.0
+            now = time.monotonic()
+            start = max(now, self._next_free)
+            self._next_free = start + self._interval
+            wait = start - now
+        if wait > 0.0:
+            time.sleep(wait)
+        return wait
+
+
+# One limiter per service, shared by every worker thread. Guarded by its own lock.
+_rate_limiters: dict[str, _ServiceRateLimiter] = {}
+_rate_limiter_lock = threading.Lock()
+
+
+def _configured_rate(service: str) -> float:
+    """Return the requests-per-minute budget for *service*.
+
+    Reads ``HALLMARK_<SERVICE>_RATE`` and falls back to the built-in default when that
+    is unset, unparseable, non-finite, or not positive. A malformed knob must never take
+    a run down, so it is logged and ignored.
+
+    Args:
+        service: Service key, e.g. ``"arxiv"``.
+
+    Returns:
+        Requests per minute; ``0.0`` means the service is unpaced.
+    """
+    default = _DEFAULT_SERVICE_RATES.get(service, 0.0)
+    raw = os.environ.get(_RATE_ENV_TEMPLATE.format(service=service.upper()))
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring %s=%r: not a number; using %s requests/min for %s",
+            _RATE_ENV_TEMPLATE.format(service=service.upper()),
+            raw,
+            default,
+            service,
+        )
+        return default
+    if not math.isfinite(value) or value <= 0.0:
+        logger.warning(
+            "Ignoring %s=%r: not a positive finite rate; using %s requests/min for %s",
+            _RATE_ENV_TEMPLATE.format(service=service.upper()),
+            raw,
+            default,
+            service,
+        )
+        return default
+    return value
+
+
+def _limiter_for(service: str) -> _ServiceRateLimiter:
+    """Return the process-wide limiter for *service*, creating it on first use.
+
+    The configured rate is re-read on every call so an env change takes effect without a
+    restart; the limiter object itself is kept, so the budget stays shared.
+    """
+    rate = _configured_rate(service)
+    with _rate_limiter_lock:
+        limiter = _rate_limiters.get(service)
+        if limiter is None:
+            limiter = _ServiceRateLimiter(rate)
+            _rate_limiters[service] = limiter
+        elif limiter.rate_per_minute != rate:
+            limiter.set_rate(rate)
+    return limiter
+
+
+def _pace(service: str) -> float:
+    """Block until this process may issue another request to *service*.
+
+    Sits in front of the request, in addition to the retry-on-throttle behaviour behind
+    it: pacing keeps us inside the budget, retries handle the times we are told we are
+    outside it anyway.
+    """
+    waited = _limiter_for(service).acquire()
+    if waited > 0.0:
+        logger.debug("Paced %s for %.2fs", service, waited)
+    return waited
+
+
+# ---------------------------------------------------------------------------
+# resolve_doi
+# ---------------------------------------------------------------------------
+
+
+def resolve_doi(doi: str) -> dict[str, str]:
+    """Resolve a DOI via CrossRef API and return normalised metadata.
+
+    Args:
+        doi: Raw DOI string (may include https://doi.org/ prefix).
+
+    Returns:
+        Normalised metadata dict.
+
+    Raises:
+        ValueError: DOI malformed or not found (404).
+        RuntimeError: Network/API error.
+    """
+    import httpx
+
+    doi_match = re.search(r"10\.\d+/[^\s]+", doi)
+    if not doi_match:
+        raise ValueError(f"Malformed DOI: {doi!r}")
+    normalized_doi = doi_match.group(0)
+
+    url = f"https://api.crossref.org/works/{urllib.parse.quote(normalized_doi, safe='/')}"
+    headers = {"User-Agent": f"HALLMARK/1.0 (mailto:{_OPENALEX_MAILTO})"}
+
+    _pace("crossref")
+    try:
+        resp = httpx.get(url, headers=headers, timeout=10.0, follow_redirects=True)
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"Network error resolving DOI {normalized_doi}: {exc}") from exc
+
+    if resp.status_code == 404:
+        raise ValueError(f"DOI not found: {normalized_doi}")
+    _raise_for_throttle(resp, "CrossRef")
+    if resp.status_code != 200:
+        raise RuntimeError(f"CrossRef returned HTTP {resp.status_code} for {normalized_doi}")
+
+    data = resp.json().get("message", {})
+    authors_list = data.get("author", [])
+    authors_str = "; ".join(
+        f"{a.get('family', '')} {a.get('given', '')}".strip() for a in authors_list
+    )
+    title_list = data.get("title", [])
+    title_str = title_list[0] if title_list else ""
+    container = data.get("container-title", [])
+    venue_str = container[0] if container else ""
+    date_parts = data.get("published", {}).get("date-parts", [[]])
+    year_str = str(date_parts[0][0]) if date_parts and date_parts[0] else ""
+
+    return _normalise(
+        {
+            "authors": authors_str,
+            "title": title_str,
+            "venue": venue_str,
+            "year": year_str,
+            "doi": normalized_doi,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# search_crossref
+# ---------------------------------------------------------------------------
+
+
+def search_crossref(query: str, limit: int = 5) -> list[dict[str, str]]:
+    """Search CrossRef by bibliographic query string.
+
+    Args:
+        query: Free-text query (title, authors, etc.).
+        limit: Maximum number of results to return.
+
+    Returns:
+        List of normalised metadata dicts (may be empty).
+
+    Raises:
+        RuntimeError: Network/API error.
+    """
+    import httpx
+
+    params = {
+        "query.bibliographic": query,
+        "rows": str(min(limit, 20)),
+        "mailto": _OPENALEX_MAILTO,
+    }
+    url = "https://api.crossref.org/works?" + urllib.parse.urlencode(params)
+    headers = {"User-Agent": f"HALLMARK/1.0 (mailto:{_OPENALEX_MAILTO})"}
+
+    _pace("crossref")
+    try:
+        resp = httpx.get(url, headers=headers, timeout=15.0, follow_redirects=True)
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"CrossRef search network error: {exc}") from exc
+
+    _raise_for_throttle(resp, "CrossRef search")
+    if resp.status_code != 200:
+        raise RuntimeError(f"CrossRef search returned HTTP {resp.status_code}")
+
+    items = resp.json().get("message", {}).get("items", [])
+    results = []
+    for item in items[:limit]:
+        authors_list = item.get("author", [])
+        authors_str = "; ".join(
+            f"{a.get('family', '')} {a.get('given', '')}".strip() for a in authors_list
+        )
+        title_list = item.get("title", [])
+        title_str = title_list[0] if title_list else ""
+        container = item.get("container-title", [])
+        venue_str = container[0] if container else ""
+        date_parts = item.get("published", {}).get("date-parts", [[]])
+        year_str = str(date_parts[0][0]) if date_parts and date_parts[0] else ""
+        doi_str = item.get("DOI", "")
+        results.append(
+            _normalise(
+                {
+                    "authors": authors_str,
+                    "title": title_str,
+                    "venue": venue_str,
+                    "year": year_str,
+                    "doi": doi_str,
+                }
+            )
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# search_openalex
+# ---------------------------------------------------------------------------
+
+
+def search_openalex(query: str, limit: int = 5) -> list[dict[str, str]]:
+    """Search OpenAlex by title/author query.
+
+    Spends the free keyless mailto pool first, then falls over to each key in
+    ``OPENALEX_API_KEY``. A credential whose ``Retry-After`` exceeds an hour has hit
+    its daily cap and is retired for the rest of the process rather than retried
+    against, so the metered keys are only touched once the free pool is gone.
+
+    Args:
+        query: Free-text query.
+        limit: Maximum number of results.
+
+    Returns:
+        List of normalised metadata dicts.
+
+    Raises:
+        RateLimitedError: The polite pool and every key are capped.
+        RuntimeError: Network/API error.
+    """
+    import httpx
+
+    base_params = {
+        "search": query,
+        "per-page": str(min(limit, 25)),
+        "mailto": _OPENALEX_MAILTO,
+        "select": "title,authorships,primary_location,publication_year,doi",
+    }
+
+    capped: RateLimitedError | None = None
+    resp = None
+    for key in _openalex_key_candidates():
+        params = dict(base_params)
+        if key is not None:
+            params["api_key"] = key
+        url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
+
+        _pace("openalex")
+        try:
+            resp = httpx.get(url, timeout=15.0, follow_redirects=True)
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"OpenAlex search network error: {exc}") from exc
+
+        try:
+            _raise_for_throttle(resp, "OpenAlex")
+        except RateLimitedError as exc:
+            # A burst throttle is the backoff layer's job, and a 503 hits every
+            # credential alike; only a daily cap is worth failing over for.
+            if not _retire_openalex_key(key, exc.retry_after, resp.status_code):
+                raise
+            capped = exc
+            continue
+
+        if _retire_openalex_key(key, None, resp.status_code):
+            # A metered key out of credit — not a throttle status, so it arrives here
+            # rather than through _raise_for_throttle, but it fails over the same way.
+            capped = RateLimitedError(
+                f"OpenAlex returned HTTP {resp.status_code}",
+                retry_after=_seconds_until_utc_midnight(),
+            )
+            continue
+        break
+    else:
+        # Every credential is retired — either they were capped in this call, or an
+        # earlier call retired them all. Surface it as a throttle so callers keep
+        # treating it as "come back later" rather than a permanent failure.
+        raise capped or RateLimitedError("OpenAlex: all credentials are out of quota")
+
+    if resp is None:  # pragma: no cover - unreachable once the loop has run a candidate
+        raise capped or RateLimitedError("OpenAlex: all credentials are out of quota")
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAlex returned HTTP {resp.status_code}")
+
+    items = resp.json().get("results", [])
+    results = []
+    for item in items[:limit]:
+        authors_list = item.get("authorships", [])
+        authors_str = "; ".join(a.get("author", {}).get("display_name", "") for a in authors_list)
+        title_str = item.get("title", "") or ""
+        source = (item.get("primary_location", {}) or {}).get("source") or {}
+        venue_str = source.get("display_name", "") or ""
+        year_str = str(item.get("publication_year", "")) if item.get("publication_year") else ""
+        doi_raw = item.get("doi", "") or ""
+        doi_str = re.sub(r"^https?://doi\.org/", "", doi_raw)
+        results.append(
+            _normalise(
+                {
+                    "authors": authors_str,
+                    "title": title_str,
+                    "venue": venue_str,
+                    "year": year_str,
+                    "doi": doi_str,
+                }
+            )
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# search_arxiv
+# ---------------------------------------------------------------------------
+
+
+def search_arxiv(query: str, limit: int = 5) -> list[dict[str, str]]:
+    """Search arXiv via the Atom API.
+
+    Args:
+        query: Free-text query (title/author terms).
+        limit: Maximum number of results.
+
+    Returns:
+        List of normalised metadata dicts (venue = "arXiv").
+
+    Raises:
+        RuntimeError: Network/API error.
+    """
+    import xml.etree.ElementTree as ET
+
+    import httpx
+
+    params = {
+        "search_query": f"all:{query}",
+        "start": "0",
+        "max_results": str(min(limit, 20)),
+    }
+    url = "https://export.arxiv.org/api/query?" + urllib.parse.urlencode(params)
+
+    _pace("arxiv")
+    try:
+        resp = httpx.get(url, timeout=_ARXIV_TIMEOUT_SECONDS, follow_redirects=True)
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"arXiv search network error: {exc}") from exc
+
+    _raise_for_throttle(resp, "arXiv")
+    if resp.status_code != 200:
+        raise RuntimeError(f"arXiv returned HTTP {resp.status_code}")
+
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom",
+    }
+    root = ET.fromstring(resp.text)
+    entries = root.findall("atom:entry", ns)
+    results = []
+    for entry in entries[:limit]:
+        title_el = entry.find("atom:title", ns)
+        title_str = (title_el.text or "").strip().replace("\n", " ") if title_el is not None else ""
+
+        authors = [
+            (name_el.text or "").strip()
+            for a in entry.findall("atom:author", ns)
+            if (name_el := a.find("atom:name", ns)) is not None
+        ]
+        authors_str = "; ".join(authors)
+
+        published_el = entry.find("atom:published", ns)
+        year_str = ""
+        if published_el is not None and published_el.text:
+            year_str = published_el.text[:4]
+
+        doi_str = ""
+        for link in entry.findall("atom:link", ns):
+            if link.get("title") == "doi":
+                doi_str = re.sub(r"^https?://doi\.org/", "", link.get("href", ""))
+                break
+
+        results.append(
+            _normalise(
+                {
+                    "authors": authors_str,
+                    "title": title_str,
+                    "venue": "arXiv",
+                    "year": year_str,
+                    "doi": doi_str,
+                }
+            )
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# search_semantic_scholar
+# ---------------------------------------------------------------------------
+
+
+def search_semantic_scholar(query: str, limit: int = 5) -> list[dict[str, str]]:
+    """Search Semantic Scholar (public Graph API) by free-text query.
+
+    Args:
+        query: Free-text query (title, authors, etc.).
+        limit: Maximum number of results.
+
+    Returns:
+        List of normalised metadata dicts.
+
+    Raises:
+        RuntimeError: Network/API error.
+    """
+    import os
+
+    import httpx
+
+    params = {
+        "query": query,
+        "limit": str(min(limit, 20)),
+        "fields": "title,authors,year,venue,externalIds",
+    }
+    url = "https://api.semanticscholar.org/graph/v1/paper/search?" + urllib.parse.urlencode(params)
+    base_headers = {"User-Agent": f"HALLMARK/1.0 (mailto:{_OPENALEX_MAILTO})"}
+    # Attach the Semantic Scholar API key when available to lift the shared-IP
+    # rate limit (otherwise the public endpoint 429s under concurrent load).
+    # Some keys are not scoped to the graph /paper/search endpoint and return
+    # 403; in that case we retry keyless (which is rate-limited but valid) so a
+    # mis-scoped key never makes search strictly worse than no key.
+    s2_key = os.environ.get("S2_API_KEY")
+    header_variants: list[dict[str, str]] = []
+    if s2_key:
+        header_variants.append({**base_headers, "x-api-key": s2_key})
+    header_variants.append(base_headers)
+
+    resp = None
+    for headers in header_variants:
+        _pace("semanticscholar")
+        try:
+            resp = httpx.get(url, headers=headers, timeout=15.0, follow_redirects=True)
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Semantic Scholar search network error: {exc}") from exc
+        if resp.status_code == 403 and "x-api-key" in headers and len(header_variants) > 1:
+            # Key rejected for this endpoint — fall through to the keyless variant.
+            continue
+        break
+
+    _raise_for_throttle(resp, "Semantic Scholar")
+    if resp is None or resp.status_code != 200:
+        code = resp.status_code if resp is not None else "no-response"
+        raise RuntimeError(f"Semantic Scholar returned HTTP {code}")
+
+    items = resp.json().get("data", []) or []
+    results = []
+    for item in items[:limit]:
+        authors_list = item.get("authors", []) or []
+        authors_str = "; ".join(a.get("name", "") for a in authors_list if a)
+        title_str = item.get("title", "") or ""
+        venue_str = item.get("venue", "") or ""
+        year_val = item.get("year")
+        year_str = str(year_val) if year_val is not None else ""
+        external_ids = item.get("externalIds") or {}
+        doi_str = external_ids.get("DOI", "") or ""
+        results.append(
+            _normalise(
+                {
+                    "authors": authors_str,
+                    "title": title_str,
+                    "venue": venue_str,
+                    "year": year_str,
+                    "doi": doi_str,
+                }
+            )
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch table (used by the agentic runner)
+# ---------------------------------------------------------------------------
+
+
+def verify_with_bibtex_updater(bibtex: str) -> dict[str, str]:
+    """Run ``bibtex-check`` on a single BibTeX entry and return its verdict.
+
+    Exposes the external ``bibtex-updater`` CLI (``bibtex-check``) as an
+    agent-callable tool.  The model receives the structured verdict
+    (status, mismatched fields, APIs consulted, confidence) and decides
+    whether to trust, override, or corroborate it with other tools.
+
+    Args:
+        bibtex: A raw BibTeX entry string (one entry, any @type).
+
+    Returns:
+        Flat dict with keys ``status``, ``confidence``, ``mismatched_fields``,
+        ``unconfirmed_fields``, ``api_sources``, ``errors``. All values are
+        strings (empty if absent).
+
+    Raises:
+        RuntimeError: ``bibtex-check`` not on PATH, or subprocess failure.
+    """
+    from hallmark.baselines.bibtexupdater import (
+        SourceOutageError,
+        _run_bibtex_check_subprocess,
+        resolve_bibtex_check_bin,
+    )
+    from hallmark.dataset.schema import BlindEntry
+    from hallmark.dataset.text_utils import parse_bibtex_entry
+
+    raw_bibtex = bibtex if bibtex.lstrip().startswith("@") else f"@misc{{x,\n{bibtex}\n}}"
+    parsed = parse_bibtex_entry(raw_bibtex)
+    if parsed is None:
+        raise RuntimeError("bibtex-check received invalid BibTeX")
+    entry = BlindEntry(
+        bibtex_key=parsed["key"],
+        bibtex_type=parsed["type"],
+        fields=parsed["fields"],
+        raw_bibtex=raw_bibtex,
+    )
+
+    if resolve_bibtex_check_bin() is None:
+        raise RuntimeError(
+            "bibtex-check not found on PATH. Install with: pipx install bibtex-updater"
+        )
+
+    _pace("bibtexupdater")
+    try:
+        # The run this call returned says whether the binary started. The
+        # module-level accessors report whichever wrapper call ran most
+        # recently, and reading those under a fan-out turns a completed check
+        # into an error record against this entry.
+        run = _run_bibtex_check_subprocess(
+            [entry], timeout=180.0, rate_limit=120, academic_only=True
+        )
+    except SourceOutageError as exc:
+        return {
+            "status": "sources_unavailable",
+            "confidence": "",
+            "mismatched_fields": "",
+            "unconfirmed_fields": "",
+            "api_sources": "",
+            "errors": _trunc(str(exc)),
+        }
+
+    if not run.ran:
+        raise RuntimeError(
+            "bibtex-check not found on PATH. Install with: pipx install bibtex-updater"
+        )
+    raw_records: list[dict[str, object]] = list(run.raw_records)
+    if not raw_records and run.predictions:
+        # Malformed legacy output can omit ``key``. Preserve the verdict the
+        # shared parser recovered without bypassing its outage handling.
+        import ast
+
+        prediction = run.predictions[0]
+        reason = prediction.reason or ""
+        status_match = re.search(r"Status: ([^;]+)", reason)
+        mismatched_match = re.search(r"Mismatched: (\[[^;]*\])", reason)
+        mismatched: list[str] = []
+        if mismatched_match:
+            try:
+                parsed_mismatched = ast.literal_eval(mismatched_match.group(1))
+            except (SyntaxError, ValueError):
+                pass
+            else:
+                if isinstance(parsed_mismatched, list):
+                    mismatched = [str(field) for field in parsed_mismatched]
+        raw_records = [
+            {
+                "key": entry.bibtex_key,
+                "status": status_match.group(1) if status_match else "unknown",
+                "confidence": prediction.confidence,
+                "mismatched_fields": mismatched,
+                "api_sources": prediction.api_sources_queried,
+            }
+        ]
+    if not raw_records:
+        raise RuntimeError("bibtex-check produced no output")
+
+    rec = next(
+        (record for record in raw_records if record.get("key") == entry.bibtex_key),
+        raw_records[0],
+    )
+
+    def _join_values(value: object, separator: str) -> str:
+        if not isinstance(value, list):
+            return ""
+        return separator.join(str(item) for item in value)
+
+    return {
+        "status": _trunc(rec.get("status", "unknown")),
+        "confidence": _trunc(rec.get("confidence", "")),
+        "mismatched_fields": _trunc(_join_values(rec.get("mismatched_fields"), ", ")),
+        "unconfirmed_fields": _trunc(_join_values(rec.get("unconfirmed_fields"), ", ")),
+        "api_sources": _trunc(_join_values(rec.get("api_sources"), ", ")),
+        "errors": _trunc(_join_values(rec.get("errors"), "; ")),
+    }
+
+
+_HALLUCINATION_TYPE_INSTRUCTION = """\
+When the entry is HALLUCINATED, classify the hallucination mode using exactly one of:
+`fabricated_doi`, `nonexistent_venue`, `placeholder_authors`, `future_date`,
+`chimeric_title`, `wrong_venue`, `swapped_authors`, `preprint_as_published`,
+`hybrid_fabrication`, `near_miss_title`, `plausible_fabrication`,
+`merged_citation`, `partial_author_list`, `arxiv_version_mismatch`.
+Brief definitions:
+- `fabricated_doi`: DOI does not resolve / is invented.
+- `nonexistent_venue`: venue/journal does not exist.
+- `placeholder_authors`: authors are placeholders ("Author1", "et al." alone, etc.).
+- `future_date`: year is in the future relative to publication.
+- `chimeric_title`: title combines fragments from multiple real works.
+- `wrong_venue`: real paper but cited at wrong venue.
+- `swapped_authors`: authors swapped or mismatched against the real paper.
+- `preprint_as_published`: arXiv preprint cited as published in a venue.
+- `hybrid_fabrication`: real DOI but other metadata (authors/title) doesn't match the DOI target.
+- `near_miss_title`: title differs from a real paper by small but meaningful edits.
+- `plausible_fabrication`: entirely fabricated yet plausible-sounding paper.
+- `merged_citation`: metadata combined from two real papers.
+- `partial_author_list`: real paper but author list is incomplete.
+- `arxiv_version_mismatch`: arXiv version cited as a different version (or as published).
+`predicted_hallucination_type` MUST be null when label is VALID or UNCERTAIN."""
+
+TOOL_DEFINITIONS: list[dict] = [
+    {
+        "name": "resolve_doi",
+        "description": (
+            "Resolve a DOI via CrossRef and return publication metadata. "
+            "Use when the entry has a DOI that may be fabricated or mismatched."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"doi": {"type": "string", "description": "The DOI string to resolve."}},
+            "required": ["doi"],
+        },
+    },
+    {
+        "name": "search_crossref",
+        "description": (
+            "Search CrossRef by title, author, or other bibliographic terms. "
+            "Returns up to `limit` matching publications."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Bibliographic search query (title, authors, etc.).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum results to return (1-20).",
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "search_openalex",
+        "description": (
+            "Search OpenAlex for publications. Covers a broad corpus including "
+            "preprints and grey literature."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query string."},
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum results to return (1-25).",
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "search_arxiv",
+        "description": (
+            "Search arXiv preprints by title or author. "
+            "Useful for preprint_as_published and arxiv_version_mismatch hallucination types."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "arXiv search query."},
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum results to return (1-20).",
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "search_semantic_scholar",
+        "description": (
+            "Search Semantic Scholar's Graph API for publications. Returns title, "
+            "authors, year, venue, and DOI (when available)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Free-text search query."},
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum results to return (1-20).",
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+]
+
+# Map tool name → callable
+TOOL_REGISTRY: dict[str, object] = {
+    "resolve_doi": resolve_doi,
+    "search_crossref": search_crossref,
+    "search_openalex": search_openalex,
+    "search_arxiv": search_arxiv,
+    "search_semantic_scholar": search_semantic_scholar,
+    "verify_with_bibtex_updater": verify_with_bibtex_updater,
+}
+
+
+# Stand-alone definition for the BTU-only agentic variant.  Kept separate from
+# TOOL_DEFINITIONS so the default four-tool suite remains bit-identical.
+BTU_TOOL_DEFINITION: dict = {
+    "name": "verify_with_bibtex_updater",
+    "description": (
+        "Verify a BibTeX entry using the bibtex-updater tool, which cross-references "
+        "CrossRef, DBLP, and Semantic Scholar and returns a structured status "
+        "(verified / not_found / title_mismatch / author_mismatch / etc.) along "
+        "with mismatched fields and consulted APIs. Pass the full BibTeX entry as "
+        "a single string. You may call this multiple times, but each call has a "
+        "non-trivial latency budget."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "bibtex": {
+                "type": "string",
+                "description": "Full BibTeX entry to verify (e.g. @inproceedings{key, ...}).",
+            }
+        },
+        "required": ["bibtex"],
+    },
+}

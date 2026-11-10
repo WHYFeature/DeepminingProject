@@ -1,0 +1,253 @@
+"""Tool-augmented LLM baseline: GPT-5.1 + bibtex-updater evidence injection.
+
+Runs bibtex-updater first, formats its structured output (status, mismatched
+fields, APIs queried), and injects it into an augmented LLM prompt. The LLM
+makes the final classification with both the raw BibTeX and tool evidence.
+
+This is the realistic deployment scenario (LLM + verification APIs) and tests
+whether combining both signals improves over either alone.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from hallmark.dataset.schema import BlindEntry, Prediction
+
+logger = logging.getLogger(__name__)
+
+TOOL_AUGMENTED_PROMPT = """\
+You are a citation verification expert. Analyze the following BibTeX entry \
+and determine if it is a VALID real publication or a HALLUCINATED (fabricated) citation.
+
+BibTeX entry:
+```bibtex
+{bibtex}
+```
+
+An automated verification tool checked this entry against CrossRef, DBLP, \
+and Semantic Scholar. Results:
+
+{tool_evidence}
+
+Use the tool's findings as evidence, but apply your own judgment:
+- If the tool found mismatches, are they real errors or API artifacts?
+- If the tool verified the entry, could it still be a sophisticated fabrication?
+- Consider author plausibility, venue existence, and title coherence.
+
+When the entry is HALLUCINATED, classify the hallucination mode using exactly one of:
+`fabricated_doi`, `nonexistent_venue`, `placeholder_authors`, `future_date`,
+`chimeric_title`, `wrong_venue`, `swapped_authors`, `preprint_as_published`,
+`hybrid_fabrication`, `near_miss_title`, `plausible_fabrication`,
+`merged_citation`, `partial_author_list`, `arxiv_version_mismatch`.
+Brief definitions:
+- `fabricated_doi`: DOI does not resolve / is invented.
+- `nonexistent_venue`: venue/journal does not exist.
+- `placeholder_authors`: authors are placeholders ("Author1", "et al." alone, etc.).
+- `future_date`: year is in the future relative to publication.
+- `chimeric_title`: title combines fragments from multiple real works.
+- `wrong_venue`: real paper but cited at wrong venue.
+- `swapped_authors`: authors swapped or mismatched against the real paper.
+- `preprint_as_published`: arXiv preprint cited as published in a venue.
+- `hybrid_fabrication`: real DOI but other metadata (authors/title) doesn't match the DOI target.
+- `near_miss_title`: title differs from a real paper by small but meaningful edits.
+- `plausible_fabrication`: entirely fabricated yet plausible-sounding paper.
+- `merged_citation`: metadata combined from two real papers.
+- `partial_author_list`: real paper but author list is incomplete.
+- `arxiv_version_mismatch`: arXiv version cited as a different version (or as published).
+
+Respond with JSON only:
+{{"label": "VALID" or "HALLUCINATED" or "UNCERTAIN", "confidence": 0.0 to 1.0, \
+"predicted_hallucination_type": "<one of the 14 types above, or null>", "reason": "..."}}
+
+`predicted_hallucination_type` MUST be null when label is VALID or UNCERTAIN."""
+
+
+def format_tool_evidence(record: dict[str, Any]) -> str:
+    """Convert a raw bibtex-check JSONL record into readable text for prompt injection.
+
+    Handles missing records, api_error status, and partial results gracefully.
+    """
+    if not record:
+        return "No tool results available for this entry."
+
+    status = record.get("status", "unknown")
+
+    if status == "api_error":
+        errors = record.get("errors", [])
+        error_str = "; ".join(str(e) for e in errors) if errors else "unknown error"
+        return f"Tool could not verify this entry — API unreachable ({error_str})."
+
+    parts: list[str] = [f"Status: {status}"]
+
+    confidence = record.get("confidence")
+    if confidence is not None:
+        parts.append(f"Confidence: {confidence:.2f}")
+
+    mismatched = record.get("mismatched_fields", [])
+    if "unconfirmed_fields" in record:
+        if mismatched:
+            parts.append(f"Fields the checker refuted: {', '.join(str(f) for f in mismatched)}")
+        unconfirmed = record.get("unconfirmed_fields", [])
+        if unconfirmed:
+            parts.append(
+                "Fields it could not compare (not a disagreement): "
+                f"{', '.join(str(f) for f in unconfirmed)}"
+            )
+    elif mismatched:
+        parts.append(
+            "Fields this build could not separate into refuted vs. not-compared: "
+            f"{', '.join(str(f) for f in mismatched)}"
+        )
+    if "unconfirmed_fields" not in record and status == "unconfirmed":
+        parts.append(
+            "This unconfirmed status means the checker confirmed nothing; "
+            "it did not establish that any field disagreed."
+        )
+
+    api_sources = record.get("api_sources", [])
+    if api_sources:
+        parts.append(f"APIs consulted: {', '.join(api_sources)}")
+
+    errors = record.get("errors", [])
+    if errors:
+        parts.append(f"Warnings: {'; '.join(str(e) for e in errors)}")
+
+    return "\n".join(parts)
+
+
+def load_tool_evidence(jsonl_path: Path) -> dict[str, dict[str, Any]]:
+    """Load pre-saved raw bibtex-check JSONL into a keyed dict.
+
+    Returns:
+        Mapping from bibtex_key to raw record dict.
+    """
+    from hallmark.baselines.bibtexupdater import parse_jsonl_to_raw
+
+    return parse_jsonl_to_raw(jsonl_path)
+
+
+def save_tool_evidence(
+    entries: list[BlindEntry],
+    output_path: Path,
+    extra_args: list[str] | None = None,
+    timeout: float = 7200.0,
+    rate_limit: int = 120,
+    academic_only: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Run bibtex-updater and save raw JSONL output for later evidence injection.
+
+    Returns:
+        Mapping from bibtex_key to raw record dict.
+    """
+    import json
+    import os
+
+    from hallmark.baselines.bibtexupdater import (
+        BIBTEX_CHECK_BIN_ENV,
+        _run_bibtex_check_subprocess,
+        resolve_bibtex_check_bin,
+    )
+
+    if resolve_bibtex_check_bin() is None:
+        pinned = os.environ.get(BIBTEX_CHECK_BIN_ENV)
+        if pinned:
+            raise RuntimeError(
+                f"{BIBTEX_CHECK_BIN_ENV} points at a missing bibtex-check binary: {pinned}"
+            )
+        logger.error("bibtex-check not found. Install with: pipx install bibtex-updater")
+        return {}
+
+    # Read the outcome off the run this call returned. The module-level
+    # accessors report whichever wrapper call ran most recently, so under a
+    # fan-out they say the binary never started for an entry it did verify,
+    # and the entry reaches the model as one the tool never saw.
+    run = _run_bibtex_check_subprocess(
+        entries,
+        extra_args=extra_args,
+        timeout=timeout,
+        rate_limit=rate_limit,
+        academic_only=academic_only,
+    )
+    if not run.ran:
+        return {}
+    if not run.raw_records:
+        logger.warning("No JSONL output produced by bibtex-check")
+        return {}
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("".join(json.dumps(record) + "\n" for record in run.raw_records))
+    return {
+        str(record["key"]): record
+        for record in run.raw_records
+        if isinstance(record.get("key"), str) and record["key"]
+    }
+
+
+def verify_tool_augmented(
+    entries: list[BlindEntry],
+    model: str = "gpt-5.1",
+    api_key: str | None = None,
+    base_url: str | None = None,
+    tool_evidence_path: Path | str | None = None,
+    log_dir: Path | None = None,
+    checkpoint_dir: Path | None = None,
+    **kwargs: Any,
+) -> list[Prediction]:
+    """LLM verification augmented with bibtex-updater tool evidence.
+
+    Args:
+        entries: Benchmark entries to verify.
+        model: LLM model identifier (default: gpt-5.1).
+        api_key: OpenAI API key (falls back to OPENAI_API_KEY env var).
+        base_url: Override the OpenAI base URL (e.g. ``https://openrouter.ai/api/v1``
+            to route through OpenRouter without mutating ``os.environ``).
+        tool_evidence_path: Path to pre-computed bibtex-check raw JSONL.
+            If None, runs bibtex-check live to generate evidence.
+        log_dir: Optional directory for per-entry API call logs.
+        checkpoint_dir: Directory for JSONL checkpoint files.
+        **kwargs: Additional arguments forwarded to the LLM call.
+    """
+    from hallmark.baselines.llm_verifier import _verify_with_openai_compatible
+
+    # Load or compute tool evidence
+    evidence: dict[str, dict[str, Any]]
+    if tool_evidence_path is not None:
+        evidence_path = Path(tool_evidence_path)
+        if evidence_path.exists():
+            evidence = load_tool_evidence(evidence_path)
+            logger.info(f"Loaded tool evidence for {len(evidence)} entries from {evidence_path}")
+        else:
+            logger.warning(f"Tool evidence file not found: {evidence_path}, running live")
+            evidence = save_tool_evidence(entries, evidence_path)
+    else:
+        # Generate evidence to a temp file
+        tmpdir = tempfile.mkdtemp()
+        try:
+            tmp_evidence_path = Path(tmpdir) / "tool_evidence.jsonl"
+            evidence = save_tool_evidence(entries, tmp_evidence_path)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # Build per-entry prompt function that injects tool evidence
+    def _make_prompt(entry: BlindEntry) -> str:
+        bibtex = entry.to_bibtex()
+        record = evidence.get(entry.bibtex_key, {})
+        tool_text = format_tool_evidence(record)
+        return TOOL_AUGMENTED_PROMPT.format(bibtex=bibtex, tool_evidence=tool_text)
+
+    return _verify_with_openai_compatible(
+        entries,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        source_prefix="openai_tool_augmented",
+        log_dir=log_dir,
+        checkpoint_dir=checkpoint_dir,
+        prompt_fn=_make_prompt,
+        **kwargs,
+    )

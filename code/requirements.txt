@@ -1,0 +1,10 @@
+# 复现本课程论文所需依赖（Python >= 3.10；实测环境 Python 3.12.14）
+# 前四项为 HALLMARK 官方仓库 pyproject.toml 中的核心依赖
+bibtexparser>=2.0.0b
+requests>=2.28
+httpx>=0.24
+rapidfuzz>=3.0
+# 以下为离线扩展实验与绘图依赖（实测锁定版本）
+matplotlib==3.11.2
+numpy==2.5.4
+pillow==12.3.0
